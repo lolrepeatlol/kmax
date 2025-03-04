@@ -11,6 +11,8 @@ from kmax import patch
 import pathlib
 from functools import reduce
 
+start_time = None
+
 z3_true = z3.BoolVal(True)
 
 class BasicLogger:
@@ -1138,9 +1140,11 @@ def klocalizerCLI():
     # by the current architecture. This means, we can do several iterations
     # on the same architecture to account for mutually exclusive configurations.
     arch_idx = 0
+    increment = 0
     printed_arch_info = False
     got_first_improvement = False
     while arch_idx < len(archs) and requirements:
+      increment += 1
       # Assign the architecture to work with.
       arch = archs[arch_idx]
 
@@ -1228,7 +1232,66 @@ def klocalizerCLI():
           # Get exclusion constraints
           c = get_exclusion_constraints(unit_kmax_c, unit_line_c)
           accumulated_constraints.extend(c)
-    
+
+      logger.info("Writing constraints for patchset...\n")
+      constraints_file = "patch_constraints.txt"
+
+      # Check if file already exists
+      should_write_constraints = True
+      if os.path.exists(constraints_file):
+        logger.info("Constraints file already exists, skipping write...\n")
+        should_write_constraints = False
+
+      # If file doesn't exist, proceed with constraint collection and writing
+      if should_write_constraints:
+          import time
+          global start_time
+          start_time = time.time()
+          file_constraints = {}
+          for unit, lines in requirements:
+            srcfile = unit2srcfile(unit)
+            logger.debug(f"Checking constraints for {unit} -> {srcfile}\n")
+            logger.debug(f"Available architectures: {list(line_constraints[srcfile].keys())}\n")
+            if not unit.endswith('/'):
+                srcfile = unit2srcfile(unit)
+                file_constraints[unit] = []  # List to maintain order and structure
+
+                # Get Makefile constraints
+                if unit in kmax_constraints and kmax_constraints[unit]:
+                    file_constraints[unit].extend(kmax_constraints[unit])
+
+                # Get line presence conditions
+                if arch.name in line_constraints[srcfile]:
+                    cb = line_constraints[srcfile][arch.name]
+                    if cb is not None:
+                        for line in lines:
+                            if line != 0:
+                                deepest_block = cb.get_deepest_block(line)
+                                if deepest_block:
+                                    file_constraints[unit].extend(deepest_block.pc.assertions())
+
+                # Get accumulated constraints
+                constraints_with_file = accumulated_constraints + kmax_constraints[unit]
+                file_constraints[unit].extend(constraints_with_file)
+
+          # Write constraints while preserving structure
+          with open(constraints_file, "w") as f:
+            f.write(f"# Constraints collected for arch: {arch.name}\n")
+
+            for unit in file_constraints:
+                f.write(f"\n# Unit: {unit}\n")
+
+                for constraint in file_constraints[unit]:
+                    try:
+                        # Convert directly to S-expression format
+                        sexpr = constraint.sexpr()
+                        f.write(f"{sexpr}\n")
+                    except Exception as e:
+                        logger.warning(f"Failed to write constraint for {unit}: {e}\n")
+                        continue
+
+          logger.info("Constraints written for patchset\n")
+
       # Keep track of whether there is an improvement found to the coverage
       # with the accumulated constraints. If not, loop will continue with
       # the next architecture. Otherwise, the loop will give this arch
@@ -1404,20 +1467,63 @@ def klocalizerCLI():
         assert compiled_arch_constraints
         assert accumulated_constraints
         full_constraints = compiled_arch_constraints + accumulated_constraints
-        # Repair is done here only since this is where the final model to
-        # get the config file is produced.
+
+        with open("old_krepair_smt.smt2", "w") as f:
+            for constraint in full_constraints:
+                f.write(str(constraint) + "\n")
+
+        print("\n[DEBUG] Old implementation SMT script saved as 'old_krepair_smt.smt2'")
+
         apprx_constraints = approximate_constraints.get(arch.name, approximate_constraints.get("default", None))
+
+        # Add debugging for the full constraints
+        print(f"[DEBUG] Old implementation - Full constraints count: {len(full_constraints)}")
+        if full_constraints:
+            print(f"[DEBUG] Old implementation - Full constraints context: {full_constraints[0].ctx}")
+
         model_sampler = Klocalizer.Z3ModelSampler(full_constraints, approximate_constraints=apprx_constraints, random_seed=random_seed, logger=logger)
         is_sat, z3_model = model_sampler.sample_model()
         assert is_sat
         assert current_coverage
         z3_models.append((arch, z3_model, current_coverage))
+        # Add debug logging
+        print(f"[DEBUG] Model declarations: {len(z3_model.decls())}")
+        print(f"[DEBUG] True assignments: {sum(1 for d in z3_model.decls() if z3_model[d] == True)}")
+        print(f"[DEBUG] CONFIG_ assignments: {sum(1 for d in z3_model.decls() if str(d).startswith('CONFIG_'))}")
+
         logger.debug("Sampled a model\n")
+
+        # Now, write out only the constraints that are explicitly covered.
+        covered_constraints = {}  # We'll build a dict: { unit : [constraints] }
+        for unit, lines in current_coverage.items():
+            covered_constraints.setdefault(unit, [])
+            # Add file-level (Makefile) constraints.
+            if unit in kmax_constraints and kmax_constraints[unit]:
+                covered_constraints[unit].extend(kmax_constraints[unit])
+            # For each covered line, add the corresponding line-specific constraints.
+            srcfile = unit2srcfile(unit)
+            if arch.name in line_constraints[srcfile]:
+                cb = line_constraints[srcfile][arch.name]
+                if cb is not None:
+                    for line in lines:
+                        deepest_block = cb.get_deepest_block(line)
+                        if deepest_block:
+                            covered_constraints[unit].extend(deepest_block.pc.assertions())
+
+        # Write the covered constraints to a file.
+        covered_file = f"covered_patch_constraints_{increment}_idx{arch_idx}.txt"
+        with open(covered_file, "w") as f:
+            f.write(f"# Covered constraints {increment} collected for arch: {arch.name}\n")
+            for unit in covered_constraints:
+                f.write(f"\n# Unit: {unit}\n")
+                for c in covered_constraints[unit]:
+                    try:
+                        f.write(f"{c.sexpr()}\n")
+                    except Exception as e:
+                        logger.warning(f"Failed to write constraint for {unit}: {e}\n")
+        logger.info(f"Covered constraints written to {covered_file}\n")
       else:
-        # Continue with the next arch as this could not improve coverage anymore.
-        # We don't change the architecture right away if there is improvement
-        # because something that could not be covered in this iteration
-        # might get covered in next iteration due to mutual exclusion.
+        # Continue with the next architecture as this could not improve coverage anymore.
         arch_idx += 1
         printed_arch_info = False
 
@@ -1470,7 +1576,40 @@ def klocalizerCLI():
         approximate_config = None
       if no_nonbool_preservation:
         approximate_config = None
+
+      config_count = 0
+      module_count = 0
+      print(f"[DEBUG] Total CONFIG_ declarations found in model: {config_count}")
+      print(f"[DEBUG] Total potential module options: {module_count}")
+
+      # Add to both implementations before calling get_config_from_model
+      tristate_pattern = re.compile(r'CONFIG_(.+)_TRISTATE_(y|m)')
+      tristate_settings = {}
+      for entry in model.decls():
+        str_entry = str(entry)
+        matches = tristate_pattern.match(str_entry)
+        if matches and model[entry]:
+            config_name = matches.group(1)
+            config_setting = matches.group(2)
+            tristate_settings[config_name] = config_setting
+
+      print(f"Tristate settings count: {len(tristate_settings)}")
+      print(f"Sample tristate settings: {list(tristate_settings.items())[:5]}")
+
       config_content = Klocalizer.get_config_from_model(model, arch, set_tristate_m=modules_arg, allow_non_visibles=allow_non_visibles, approximate_config=approximate_config)
+      print(f"[DEBUG] allow_non_visibles={allow_non_visibles} in get_config_from_model")
+      print(f"[DEBUG] set_tristate_m={modules_arg} in get_config_from_model")
+      config_lines = config_content.splitlines()
+      y_count = sum(1 for l in config_lines if '=y' in l)
+      m_count = sum(1 for l in config_lines if '=m' in l)
+      n_count = sum(1 for l in config_lines if '=n' in l)
+      print(f"[DEBUG] Config breakdown:")
+      print(f"  y (built-in): {y_count}")
+      print(f"  m (module): {m_count}")
+      print(f"  n (not set): {n_count}")
+      print(f"[DEBUG] Total lines to write: {len(config_lines)}")
+      config_options = [l for l in config_lines if l.startswith('CONFIG_')]
+      print(f"[DEBUG] Total CONFIG options to write: {len(config_options)}")
       # Write the config file
       with open(config_file_path, 'w') as f:
         f.write(config_content)
@@ -1721,24 +1860,29 @@ def klocalizerCLI():
     exit(11)
 
 if __name__ == '__main__':
-  logger = BasicLogger()
-  try:
-    klocalizerCLI()
-  except Klocalizer.NoFormulaFoundForCompilationUnit as e:
-    logger.error("No formula from kmax was found for the compilation unit: %s\n" % (e.unit))
-    exit(3)
-  except Klocalizer.MultipleCompilationUnitsMatch as e:
-    logger.error("There are multiple compilation units that match %s.  Please provide one of the Kbuild paths from below.\n" % (e.unit))
-    print("\n".join(e.matching_units))
-    exit(4)
-  except Arch.FormulaFileNotFound as e:
-    logger.error("Cannot find %s formulas file: %s\n" % (e.formula_type, e.filepath))
-    exit(6)
-  except Arch.FormulaGenerationError as e:
-    logger.error("Cannot generate %s formulas.\n" % (e.formula_type))
-    exit(13)
-  except SuperC.SuperC_ChecksFailed as e:
-    logger.error("SuperC checks failed, reason: %s.  "
-                 "Either fix the issue or omit the line requirements.\n" % (e.reason))
-  
-  exit(0)
+    logger = BasicLogger()
+    try:
+        klocalizerCLI()
+    except Klocalizer.NoFormulaFoundForCompilationUnit as e:
+        logger.error("No formula from kmax was found for the compilation unit: %s\n" % (e.unit))
+        exit(3)
+    except Klocalizer.MultipleCompilationUnitsMatch as e:
+        logger.error("There are multiple compilation units that match %s.  Please provide one of the Kbuild paths from below.\n" % (e.unit))
+        print("\n".join(e.matching_units))
+        exit(4)
+    except Arch.FormulaFileNotFound as e:
+        logger.error("Cannot find %s formulas file: %s\n" % (e.formula_type, e.filepath))
+        exit(6)
+    except Arch.FormulaGenerationError as e:
+        logger.error("Cannot generate %s formulas.\n" % (e.formula_type))
+        exit(13)
+    except SuperC.SuperC_ChecksFailed as e:
+        logger.error("SuperC checks failed, reason: %s.  Either fix the issue or omit the line requirements.\n" % (e.reason))
+        exit(1)
+    finally:
+        # This block will run even if klocalizerCLI() calls exit()
+        if start_time is not None:
+            import time  # Ensure time is available here
+            logger.info(f"Total time elapsed: {time.time() - start_time:.2f} seconds\n")
+
+    exit(0)
