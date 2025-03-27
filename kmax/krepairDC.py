@@ -1136,15 +1136,76 @@ class krepairDivQ:
 
     def _attempt_merge_chunks(self, valid_by_chunk):
         """
-        Perform balanced merging of groups of patch constraints by pairing groups
-        with similar sizes.
+        Perform merging of groups of patch constraints in two phases:
+          1. In-Order Merge: try merging adjacent chunks (by natural order) repeatedly.
+          2. Merge-As-Much-As-Possible: if no in-order merges occur, try merging any pair
+             (using a size-based ordering) until no further merges can be made.
+             If a merge fails, retrieve the unsat core using Z3.
         """
+        from collections import defaultdict
         tried_chunks = defaultdict(set)
-        completed_sets = set()
-        iteration = 0
+        completed_sets = set()  # (unused in this snippet, but kept for future use)
 
+        # PHASE 1: In-Order Merge
+        iteration = 0
         while True:
-            # Order chunks by the number of constraints (smallest first)
+            # Use natural order (e.g. numerical order) for in-order merging.
+            chunk_ids = sorted(valid_by_chunk.keys())
+            if not chunk_ids:
+                break
+
+            iteration += 1
+            if iteration > 100:
+                print("Breaking in-order merge loop after 100 iterations to prevent infinite loop.")
+                break
+
+            print(f"\n=== Iteration {iteration}: In-Order Merge ===")
+            print(f"Remaining chunks: {chunk_ids}")
+
+            iteration_merged = False
+
+            # Attempt to merge adjacent pairs: (0,1), (2,3), etc.
+            i = 0
+            while i < len(chunk_ids) - 1:
+                c1 = chunk_ids[i]
+                c2 = chunk_ids[i + 1]
+                # Skip if already tried merging this pair.
+                if c2 in tried_chunks[c1]:
+                    i += 2
+                    continue
+
+                print(f"\nPass: Trying to merge Chunk {c1} with Chunk {c2}...")
+                merged_constraints = valid_by_chunk[c1] + valid_by_chunk[c2]
+                if self._test_chunk_satisfiability(merged_constraints):
+                    print(f"  ✓ Merge success: {c1} + {c2} → {len(merged_constraints)} constraints")
+                    # Update c1 with the merged constraints.
+                    valid_by_chunk[c1] = merged_constraints
+                    # Remove c2 from valid_by_chunk.
+                    del valid_by_chunk[c2]
+                    # Record that we've tried merging these two.
+                    tried_chunks[c1].add(c2)
+                    tried_chunks[c2].add(c1)
+                    iteration_merged = True
+                    # Since c2 is gone, update the list and re-evaluate at the same index.
+                    chunk_ids = sorted(valid_by_chunk.keys())
+                    continue  # Re-evaluate at the same index.
+                else:
+                    # Retrieve the unsat core for debugging.
+                    unsat_core = self._get_unsat_core(merged_constraints)
+                    print(f"  ✗ Merge failed: {c1} + {c2} → UNSAT; Unsat Core: {unsat_core}")
+                    tried_chunks[c1].add(c2)
+                    tried_chunks[c2].add(c1)
+                i += 2  # move to the next pair
+
+            if not iteration_merged:
+                print("No in-order merges succeeded in this iteration. Moving to general merge phase.")
+                break
+            else:
+                print("In-order merges happened; starting a new in-order iteration...")
+
+        # PHASE 2: Merge-As-Much-As-Possible
+        iteration = 0
+        while True:
             chunk_ids = sorted(valid_by_chunk.keys(), key=lambda cid: len(valid_by_chunk[cid]))
             if not chunk_ids:
                 break
@@ -1154,62 +1215,164 @@ class krepairDivQ:
                 print("Breaking merge loop after 100 iterations to prevent infinite loop.")
                 break
 
-            print(f"\n=== Iteration {iteration}: Balanced Merge by Similar Size ===")
+            print(f"\n=== Iteration {iteration}: Merge As Much As Possible ===")
             print(f"Remaining chunks: {chunk_ids}")
 
             iteration_merged = False
             used_this_pass = set()
 
-            # Process each chunk in order; try to merge with the closest-in-size partner.
+            # Try all pairs, favoring merging smaller chunks first.
             for i, c1 in enumerate(chunk_ids):
                 if c1 in completed_sets or c1 in used_this_pass:
                     continue
-
-                best_candidate = None
-                best_diff = float('inf')
-                # Look for a partner among the chunks after c1.
                 for j in range(i + 1, len(chunk_ids)):
                     c2 = chunk_ids[j]
                     if c2 in completed_sets or c2 in used_this_pass or c2 in tried_chunks[c1]:
                         continue
-                    # Calculate the size difference.
-                    size_diff = abs(len(valid_by_chunk[c1]) - len(valid_by_chunk[c2]))
-                    if size_diff < best_diff:
-                        best_diff = size_diff
-                        best_candidate = c2
-
-                if best_candidate is not None:
-                    c2 = best_candidate
                     print(f"\nPass: Trying to merge Chunk {c1} ({len(valid_by_chunk[c1])} constraints) "
                           f"with Chunk {c2} ({len(valid_by_chunk[c2])} constraints)...")
                     merged_constraints = valid_by_chunk[c1] + valid_by_chunk[c2]
                     if self._test_chunk_satisfiability(merged_constraints):
                         print(f"  ✓ Merge success: {c1} + {c2} → {len(merged_constraints)} constraints")
-                        # Update group c1 with the merged constraints.
                         valid_by_chunk[c1] = merged_constraints
-                        # Remove c2 from the dictionary.
                         del valid_by_chunk[c2]
                         used_this_pass.add(c1)
                         used_this_pass.add(c2)
                         tried_chunks[c1].add(c2)
                         tried_chunks[c2].add(c1)
                         iteration_merged = True
+                        break  # Exit inner loop to update ordering after a merge.
                     else:
-                        print(f"  ✗ Merge failed: {c1} + {c2} → UNSAT")
+                        unsat_core = self._get_unsat_core(merged_constraints)
+                        print(f"  ✗ Merge failed: {c1} + {c2} → UNSAT; Unsat Core: {unsat_core}")
                         tried_chunks[c1].add(c2)
                         tried_chunks[c2].add(c1)
+                if iteration_merged:
+                    break
 
             if not iteration_merged:
-                print("No merges succeeded in this iteration. Stopping.")
+                print("No merges succeeded in this iteration. Stopping merge-as-much-as-possible phase.")
                 break
             else:
-                print("Merges happened; starting a new iteration...")
+                print("Merges happened; starting a new iteration of general merging...")
 
         print("\nFinal Merging Completed.")
         final_chunks = sorted(valid_by_chunk.keys(), key=lambda cid: len(valid_by_chunk[cid]))
         print(f"Remaining Chunks: {final_chunks}")
         print(f"Completed Sets: {len(completed_sets)}")
         return valid_by_chunk, completed_sets
+
+    def strip_outer_assert(self, constraint_text):
+        """
+        Removes an outer (assert …) wrapper if present.
+        This simple function assumes a well-formed single assertion.
+        """
+        s = constraint_text.strip()
+        if s.startswith("(assert"):
+            s = s[len("(assert"):].strip()
+            if s and s[-1] == ")":
+                s = s[:-1].strip()
+        return s
+
+    def _get_unsat_core(self, constraints):
+        """
+        Retrieve the unsat core for the given list of constraints by building a single SMT2
+        script that:
+          - Sets the logic and enables unsat core production.
+          - Adds user-provided patch declarations (if any) and auto-declares any missing CONFIG_* symbols.
+          - For each constraint, declares a fresh Boolean assumption and asserts the implication: (=> a_i <constraint>).
+
+        In addition, it builds a mapping from each assumption literal (e.g. "a5") to the list of CONFIG options
+        that appear in the corresponding constraint.
+
+        After calling solver.check with these assumptions, it returns a dictionary mapping assumption names (from
+        the unsat core) to the CONFIG option names extracted from the corresponding constraint.
+        """
+        # 1. Extract all CONFIG_* symbols from the constraints.
+        config_ids = set()
+        config_pattern = r"(CONFIG_[A-Z0-9_]+)"
+        for ct in constraints:
+            config_ids.update(re.findall(config_pattern, ct))
+
+        # 2. Gather user patch declarations (if available) and determine which CONFIG_* are already declared.
+        declared_ids = set()
+        patch_decl_text = ""
+        if hasattr(self, 'patch_declarations') and self.patch_declarations:
+            patch_decl_text = "\n".join(self.patch_declarations)
+            declared_ids = set(re.findall(r"\(declare-const\s+([A-Z0-9_]+)\s+Bool\)", patch_decl_text))
+
+        # 3. Auto-declare any missing CONFIG_* symbols.
+        auto_decls = []
+        for cfg in sorted(config_ids):
+            if cfg not in declared_ids:
+                auto_decls.append(f"(declare-const {cfg} Bool)")
+        auto_decl_text = "\n".join(auto_decls)
+
+        # 4. Build the SMT2 script.
+        script_lines = []
+        # Set logic and enable unsat core production.
+        script_lines.append("(set-logic QF_UF)")
+        script_lines.append("(set-option :produce-unsat-cores true)")
+        if patch_decl_text:
+            script_lines.append(patch_decl_text)
+        if auto_decl_text:
+            script_lines.append(auto_decl_text)
+
+        # 5. For each constraint, declare a fresh Boolean assumption.
+        num_constraints = len(constraints)
+        for idx in range(num_constraints):
+            script_lines.append(f"(declare-const a{idx} Bool)")
+
+        # 6. Build a mapping from assumption name to config options in that constraint.
+        constraint_config_map = {}
+        for idx, ct in enumerate(constraints):
+            inner = self.strip_outer_assert(ct)
+            # Extract CONFIG_* options from the inner expression.
+            config_options = re.findall(config_pattern, inner)
+            constraint_config_map[f"a{idx}"] = config_options
+            # Assert the implication using the assumption a{idx}.
+            script_lines.append(f"(assert (=> a{idx} {inner}))")
+
+        final_script = "\n".join(script_lines)
+        # Uncomment the next line for debugging the SMT2 script.
+        # print("Final SMT2 script:\n", final_script)
+
+        # 7. Create a fresh solver with unsat core tracking enabled.
+        solver = z3.Solver(ctx=self.arch_baseline_solver.ctx)
+        solver.set(unsat_core=True)
+        try:
+            solver.append(*self.arch_baseline_solver.assertions())
+        except Exception as e:
+            print(f"[ERROR] Failed to re-add baseline assertions: {e}")
+            return None
+
+        try:
+            parsed = z3.parse_smt2_string(final_script, ctx=self.arch_baseline_solver.ctx)
+            solver.add(parsed)
+        except Exception as e:
+            print(f"[ERROR] parse_smt2_string failed in _get_unsat_core: {e}")
+            # Uncomment for debugging:
+            # print(final_script)
+            return None
+
+        # 8. Create a list of assumption literals using z3.Bool with the solver's context.
+        assumption_literals = [z3.Bool(f"a{idx}", ctx=solver.ctx) for idx in range(num_constraints)]
+        # 9. Check the solver with these assumptions (passed as positional arguments).
+        res = solver.check(*assumption_literals)
+        if res == z3.sat:
+            print("[INFO] Unexpected: constraints are satisfiable when attempting to get unsat core.")
+            return None
+        elif res == z3.unknown:
+            print("[WARNING] Solver returned unknown for unsat core check.")
+            return None
+        else:
+            core = solver.unsat_core()
+            # Build a mapping from unsat assumption names to config options.
+            unsat_mapping = {}
+            for item in core:
+                item_name = str(item)
+                unsat_mapping[item_name] = constraint_config_map.get(item_name, [])
+            return unsat_mapping
 
     def _test_chunk_satisfiability(self, constraints):
         # Ensure the baseline solver is initialized.
@@ -1220,6 +1383,7 @@ class krepairDivQ:
                 print("[ERROR] arch_baseline_solver still None; cannot test satisfiability.")
                 return False
 
+        import z3
         # Create a new solver in the same context as the baseline solver.
         cloned_solver = z3.Solver(ctx=self.arch_baseline_solver.ctx)
 
@@ -1227,7 +1391,7 @@ class krepairDivQ:
         try:
             cloned_solver.append(*self.arch_baseline_solver.assertions())
         except Exception as e:
-            print(f"[ERROR] Failed to parse arch_smt2_str in _test_chunk_satisfiability: {e}")
+            print(f"[ERROR] Failed to re-add baseline assertions in _test_chunk_satisfiability: {e}")
             return False
 
         # Add the patch declarations if available.
@@ -1613,7 +1777,7 @@ def process_complete_smt_script(
 
 def main():
 
-    linux_ksrc = "/home/alexei/LinuxKernels/krepair_alg/initial_testing/linux_other300commitset_copy"
+    linux_ksrc = "/home/alexei/LinuxKernels/krepair_alg/linux_300commitset_test"
     existing_config_file = f"{linux_ksrc}/.config"
     unbootable_options_file = "/home/alexei/LinuxKernels/krepair_alg/linux_set50copy/unbootable_options.txt"
     output_dir = f"{linux_ksrc}/repaired_configs"

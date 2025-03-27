@@ -1244,9 +1244,6 @@ def klocalizerCLI():
 
       # If file doesn't exist, proceed with constraint collection and writing
       if should_write_constraints:
-          import time
-          global start_time
-          start_time = time.time()
           file_constraints = {}
           for unit, lines in requirements:
             srcfile = unit2srcfile(unit)
@@ -1291,6 +1288,9 @@ def klocalizerCLI():
                         continue
 
           logger.info("Constraints written for patchset\n")
+          import time
+          global start_time
+          start_time = time.time()
 
       # Keep track of whether there is an improvement found to the coverage
       # with the accumulated constraints. If not, loop will continue with
@@ -1883,6 +1883,6 @@ if __name__ == '__main__':
         # This block will run even if klocalizerCLI() calls exit()
         if start_time is not None:
             import time  # Ensure time is available here
-            logger.info(f"Total time elapsed: {time.time() - start_time:.2f} seconds\n")
+            logger.info(f"Total time elapsed for Algorithm 1: {time.time() - start_time:.2f} seconds\n")
 
     exit(0)
