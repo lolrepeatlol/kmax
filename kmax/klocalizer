@@ -9,7 +9,10 @@ import json
 from collections import OrderedDict
 from kmax import patch
 import pathlib
+import shutil
 from functools import reduce
+
+start_time = None
 
 z3_true = z3.BoolVal(True)
 
@@ -584,7 +587,6 @@ def klocalizerCLI():
         url_to_cached_formulas = (req.text if req.encoding is None else req.text.decode(req.encoding)).strip()
         logger.info("Found cached formulas for %s.  Downloading...\n" % (build_system_id))
         # download from the url; if we can't, then error
-        import shutil
         local_filename = url_to_cached_formulas.split('/')[-1]
         with requests.get(url_to_cached_formulas, stream=True) as r:
             with open(local_filename, 'wb') as f:
@@ -1138,9 +1140,11 @@ def klocalizerCLI():
     # by the current architecture. This means, we can do several iterations
     # on the same architecture to account for mutually exclusive configurations.
     arch_idx = 0
+    increment = 0
     printed_arch_info = False
     got_first_improvement = False
     while arch_idx < len(archs) and requirements:
+      increment += 1
       # Assign the architecture to work with.
       arch = archs[arch_idx]
 
@@ -1228,6 +1232,65 @@ def klocalizerCLI():
           # Get exclusion constraints
           c = get_exclusion_constraints(unit_kmax_c, unit_line_c)
           accumulated_constraints.extend(c)
+
+      logger.info("Writing constraints for patchset...\n")
+      constraints_file = "patch_constraints.txt"
+
+      # Check if file already exists
+      should_write_constraints = True
+      if os.path.exists(constraints_file):
+        logger.info("Constraints file already exists, skipping write...\n")
+        should_write_constraints = False
+
+      # If file doesn't exist, proceed with constraint collection and writing
+      if should_write_constraints:
+        file_constraints = {}
+        for unit, lines in requirements:
+          srcfile = unit2srcfile(unit)
+          logger.debug(f"Checking constraints for {unit} -> {srcfile}\n")
+          logger.debug(f"Available architectures: {list(line_constraints[srcfile].keys())}\n")
+          if not unit.endswith('/'):
+            srcfile = unit2srcfile(unit)
+            file_constraints[unit] = []  # List to maintain order and structure
+
+            # Get Makefile constraints
+            if unit in kmax_constraints and kmax_constraints[unit]:
+              file_constraints[unit].extend(kmax_constraints[unit])
+
+              # Get line presence conditions
+              if arch.name in line_constraints[srcfile]:
+                cb = line_constraints[srcfile][arch.name]
+                if cb is not None:
+                  for line in lines:
+                    if line != 0:
+                      deepest_block = cb.get_deepest_block(line)
+                      if deepest_block:
+                        file_constraints[unit].extend(deepest_block.pc.assertions())
+
+              # Get accumulated constraints
+              constraints_with_file = accumulated_constraints + kmax_constraints[unit]
+              file_constraints[unit].extend(constraints_with_file)
+
+        # Write constraints while preserving structure
+        with open(constraints_file, "w") as f:
+          f.write(f"# Constraints collected for arch: {arch.name}\n")
+
+          for unit in file_constraints:
+            f.write(f"\n# Unit: {unit}\n")
+
+            for constraint in file_constraints[unit]:
+              try:
+                # Convert directly to S-expression format
+                sexpr = constraint.sexpr()
+                f.write(f"{sexpr}\n")
+              except Exception as e:
+                logger.warning(f"Failed to write constraint for {unit}: {e}\n")
+                continue
+
+        logger.info("Constraints written for patchset\n")
+        import time
+        global start_time
+        start_time = time.time()
     
       # Keep track of whether there is an improvement found to the coverage
       # with the accumulated constraints. If not, loop will continue with
@@ -1282,8 +1345,17 @@ def klocalizerCLI():
         covered_blocks = set()
         cant_cover_blocks = set()
 
+        # Keep track of unbootable blocks.
+        bootability_denylist = set()
+
         # Check for each line.
         for line in lines:
+
+          # Ignore options we've previously deemed unbootable.
+          if (unit, line) in bootability_denylist:
+            logger.debug("Skipping (%s:%s) due to bootability loss in earlier attempt\n" % (unit, line))
+            continue
+
           logger.debug("Working on (%s:%s)\n" % (unit, line))
           
           #
@@ -1309,6 +1381,36 @@ def klocalizerCLI():
           #
           line_covered = False
 
+          def generate_config_from_constraints(additional_constraints, tester_label, log_idx):
+            logger.info(f"Getting config for boot_run{log_idx}_tester{tester_label}\n")
+            # Use the file path from approximate_configs (not approximate_constraints)
+            apprx_config_file_path = approximate_configs.get(arch.name, approximate_configs.get("default", None))
+            # Use the processed constraints from approximate_constraints
+            apprx_processed = approximate_constraints.get(arch.name, approximate_constraints.get("default", None))
+
+            full_constraints = compiled_arch_constraints + additional_constraints
+
+            # Use the processed constraints for SAT/model sampling.
+            model_sampler = Klocalizer.Z3ModelSampler(
+                full_constraints,
+                approximate_constraints=apprx_processed,
+                random_seed=random_seed,
+                logger=logger
+            )
+            is_sat, model = model_sampler.sample_model()
+            if not is_sat:
+                logger.info("The constraints are unsatisfiable.\n")
+                return None
+
+            # Pass the file path (which is now a string) to get_config_from_model.
+            return Klocalizer.get_config_from_model(
+                model,
+                arch,
+                set_tristate_m=modules_arg,
+                allow_non_visibles=allow_non_visibles,
+                approximate_config=apprx_config_file_path
+            )
+
           if deepest_block in cant_cover_blocks:
             # The surrounding ConditionalBlock is already determined to be
             # non coverable while checking for a different line.
@@ -1324,23 +1426,109 @@ def klocalizerCLI():
             constraints_with_line.extend(line_const)
 
             try:
-              # SAT check.
-              if compiled_arch_constraints is None:
-                compiled_arch_constraints = klocalizer.compile_constraints(arch)
+                # SAT check.
+                if compiled_arch_constraints is None:
+                    compiled_arch_constraints = klocalizer.compile_constraints(arch)
 
-              full_constraints = compiled_arch_constraints + constraints_with_line
-              logger.debug("Checking constraints: %s\n"% constraints_with_line)
-              model_sampler = Klocalizer.Z3ModelSampler(full_constraints, random_seed=random_seed, logger=logger)
-              is_sat, z3_model = model_sampler.sample_model()
+                full_constraints = compiled_arch_constraints + constraints_with_line
+                logger.debug("Checking constraints: %s\n" % constraints_with_line)
+                model_sampler = Klocalizer.Z3ModelSampler(full_constraints, random_seed=random_seed, logger=logger)
+                is_sat, z3_model = model_sampler.sample_model()
 
-              # Constraints is SAT means line is covered.
-              line_covered = is_sat
+                # If the constraints are SAT, then check for bootability.
+                if is_sat:
+                    # Suppose you want 3 clones (indexed 0..2).
+                    num_clones = 3
+                    start_idx = 0
+                    end_idx = num_clones - 1  # i.e., 2
 
-              if is_sat: # Line constraints are satisfiable
-                # The constraints are approved to be SAT and improving coverage,
-                # therefore, keep them in.
-                accumulated_constraints = constraints_with_line[:]
-                constraints_with_file = constraints_with_line[:]
+                    # We'll use a simple counter that increments for each tester in this run.
+                    global_log_idx = 1
+
+                    # 1) Generate and store the configs in archive_logs.
+                    tester_configs = {}
+                    for i in range(start_idx, end_idx + 1):
+                        tester_label = f"linux_{i}"
+                        # Pass tester_label and current log index into the function.
+                        config = generate_config_from_constraints(constraints_with_line, tester_label, global_log_idx)
+                        tester_configs[tester_label] = config
+                        global_log_idx += 1
+
+                    # We'll store them all in one directory.
+                    temp_config_dir = os.path.join(output_dir, "archive_logs")
+                    pathlib.Path(temp_config_dir).mkdir(parents=True, exist_ok=True)
+
+                    # Keep track of each tester's config path so is_unbootable_config can see it.
+                    config_paths_dict = {}
+
+                    for i in range(start_idx, end_idx + 1):
+                        tester_label = f"linux_{i}"
+                        config_filename = f"current_{i}.config"  # e.g. "current_0.config"
+                        config_path = os.path.join(temp_config_dir, config_filename)
+                        with open(config_path, "w") as f:
+                            f.write(tester_configs[tester_label])
+                        config_paths_dict[tester_label] = config_path
+
+                    # 2) Call is_unbootable_config to build + boot test each clone.
+                    unbootable = klocalizer.is_unbootable_config(
+                        config_paths_dict,
+                        arch=arch.name,
+                        start=start_idx,
+                        end=end_idx
+                    )
+
+                    if unbootable:
+                        logger.warning("Bootability lost for (%s:%s)\n" % (unit, line))
+                        bootability_denylist.add((unit, line))
+                        bootable = False
+                    else:
+                        logger.info("Bootability present for (%s:%s)\n" % (unit, line))
+                        bootable = True
+
+                    if bootable:
+                        accumulated_constraints = constraints_with_line[:]
+                        constraints_with_file = constraints_with_line[:]
+                        line_covered = True
+                    else:
+                        line_covered = False
+
+                    # 3) After is_unbootable_config finishes, archive the tester config and logs together.
+                    final_archive_dir = os.path.join(output_dir, "archive_logs")
+                    pathlib.Path(final_archive_dir).mkdir(parents=True, exist_ok=True)
+                    abs_linux_ksrc = os.path.abspath(linux_ksrc)  # Ensure linux_ksrc is absolute.
+
+                    # For each tester, simply use the next log_idx (the same one used for the config)
+                    for i in range(start_idx, end_idx + 1):
+                        tester_label = f"linux_{i}"
+                        # For simplicity, we use the same index as in the filename (extracted from current_{i}.config)
+                        # Here we assume the order is preserved.
+                        log_idx = i  # or use a separate counter if desired; this is per-run.
+                        archived_config_name = f"tempconfig_run{log_idx}_tester{tester_label}.config"
+                        archived_boot_name   = f"boot_run{log_idx}_tester{tester_label}.log"
+                        archived_build_name  = f"build_run{log_idx}_tester{tester_label}.log"
+
+                        archived_config_path = os.path.join(final_archive_dir, archived_config_name)
+                        archived_boot_path   = os.path.join(final_archive_dir, archived_boot_name)
+                        archived_build_path  = os.path.join(final_archive_dir, archived_build_name)
+
+                        # Archive the tester config.
+                        shutil.copy(config_paths_dict[tester_label], archived_config_path)
+
+                        # Determine clone directory for this tester.
+                        clone_dir = os.path.join(abs_linux_ksrc, tester_label)
+
+                        # Archive the boot log, if it exists.
+                        boot_log_path = os.path.join(clone_dir, "boot.log")
+                        if os.path.exists(boot_log_path):
+                            shutil.copy(boot_log_path, archived_boot_path)
+
+                        # Archive the build log, if it exists.
+                        build_log_path = os.path.join(clone_dir, "build.log")
+                        if os.path.exists(build_log_path):
+                            shutil.copy(build_log_path, archived_build_path)
+                else:
+                    line_covered = False
+
             except Arch.FormulaFileNotFound as e:
               logger.warning("Cannot find %s formulas file, %s, so moving on.\n" % (e.formula_type, e.filepath))
               # arch_idx += 1
@@ -1411,8 +1599,41 @@ def klocalizerCLI():
         is_sat, z3_model = model_sampler.sample_model()
         assert is_sat
         assert current_coverage
-        z3_models.append((arch, z3_model, current_coverage))
+        # Save full_constraints with the model so we can re-sample final configs later.
+        z3_models.append((arch, z3_model, current_coverage, full_constraints))
         logger.debug("Sampled a model\n")
+
+        # Now, write out only the constraints that are explicitly covered.
+        covered_constraints = {}  # We'll build a dict: { unit : [constraints] }
+        for unit, lines in current_coverage.items():
+          covered_constraints.setdefault(unit, [])
+          # Add file-level (Makefile) constraints.
+          if unit in kmax_constraints and kmax_constraints[unit]:
+            covered_constraints[unit].extend(kmax_constraints[unit])
+          # For each covered line, add the corresponding line-specific constraints.
+          srcfile = unit2srcfile(unit)
+          if arch.name in line_constraints[srcfile]:
+            cb = line_constraints[srcfile][arch.name]
+            if cb is not None:
+              for line in lines:
+                deepest_block = cb.get_deepest_block(line)
+                if deepest_block:
+                  covered_constraints[unit].extend(deepest_block.pc.assertions())
+
+          # Write the covered constraints to a file.
+          covered_file = f"covered_patch_constraints_{increment}_idx{arch_idx}.txt"
+          with open(covered_file, "w") as f:
+            f.write(f"# Covered constraints {increment} collected for arch: {arch.name}\n")
+            for unit in covered_constraints:
+              f.write(f"\n# Unit: {unit}\n")
+              for c in covered_constraints[unit]:
+                try:
+                  f.write(f"{c.sexpr()}\n")
+                except Exception as e:
+                  logger.warning(f"Failed to write constraint for {unit}: {e}\n")
+
+          logger.info(f"Covered constraints written to {covered_file}\n")
+
       else:
         # Continue with the next arch as this could not improve coverage anymore.
         # We don't change the architecture right away if there is improvement
@@ -1429,17 +1650,10 @@ def klocalizerCLI():
     # This filtering helped us to avoid calls to SuperC if all lines were
     # global. We have the coverage results for the filtered lines. Now,
     # translate back to user's original list of lines for the coverage report.
-    # Structure: { "path/to/unit": { "unit": [configs_list], 1: [configs_list], ...]  }  }
-    # "unit" is special value for all configs that compile the unit, even
-    # without any line targets.
     coverage_report = OrderedDict()
     for unit, lines in original_include_mutex_list:
       coverage_report[unit] = OrderedDict()
-      # List of configs that compiles the unit, even without specific line targets.
-      # If there is some config file that does not compile any specific lines
-      # but the unit only, it will be here together with all other configs that
-      # compile the unit.
-      coverage_report[unit]["unit"] = [] 
+      coverage_report[unit]["unit"] = []
       for l in lines:
         coverage_report[unit][l] = []
       # Values will be updated before writing the report if they were covered.
@@ -1449,47 +1663,50 @@ def klocalizerCLI():
     #
     num_models = len(z3_models)
     if num_models == 0 :
-      logger.error("No satisfying configuration found.\n")
-      exit(11)
+        logger.error("No satisfying configuration found.\n")
+        exit(11)
 
-    assert z3_models # (arch, z3_model, current_coverage) tuples
+    assert z3_models  # (arch, z3_model, current_coverage, full_constraints) tuples
     logger.info("Sampling and writing %s configuration files from models.\n" % num_models)
-    for i, (arch, model, coverage) in enumerate(z3_models):
+    for i, (arch, model, coverage, full_constraints) in enumerate(z3_models):
       config_id = "%s-%s" % (i, arch.name)
-      config_basename = "%s.config" % config_id 
-      config_file_path = os.path.join(output_dir, config_basename)
-      pathlib.Path(os.path.dirname(config_file_path)).mkdir(parents=True, exist_ok=True)
-      
-      # Sample the config from the model
-      logger.info("[%s/%s] Sampling and writing the configuration file to %s\n" % (i+1, num_models, config_file_path))
-      if arch.name in approximate_configs:
-        approximate_config = approximate_configs[arch.name]
-      elif "default" in approximate_configs:
-        approximate_config = approximate_configs["default"]
-      else:
-        approximate_config = None
-      if no_nonbool_preservation:
-        approximate_config = None
-      config_content = Klocalizer.get_config_from_model(model, arch, set_tristate_m=modules_arg, allow_non_visibles=allow_non_visibles, approximate_config=approximate_config)
-      # Write the config file
-      with open(config_file_path, 'w') as f:
-        f.write(config_content)
-      
-      # Create the coverage report for the config
-      built_mutex_units = [] #< Use for logging the build command
-      for unit, lines in original_include_mutex_list:
-        if unit in coverage:
-          built_mutex_units.append(unit)
-          coverage_report[unit]["unit"].append(config_basename)
-        for l in lines:
-          if l in global_scope_lines.get(unit, []) and unit in coverage:
-            coverage_report[unit][l].append(config_basename)
-          elif unit in coverage and l in coverage[unit]:
-            coverage_report[unit][l].append(config_basename)
+      for ver in range(3):  # Create three versions: ver0, ver1, ver2
+        config_basename = "%s_ver%s.config" % (config_id, ver)
+        config_file_path = os.path.join(output_dir, config_basename)
+        pathlib.Path(os.path.dirname(config_file_path)).mkdir(parents=True, exist_ok=True)
 
-      # Log the build command
-      build_cmd = "KCONFIG_CONFIG=%s %s ARCH=%s olddefconfig clean %s" % (config_file_path, cross_compiler, arch.name, " ".join([u for u, _ in include_list] + built_mutex_units))
-      logger.info("Build with \"%s\"\n" % build_cmd)
+        logger.info("[%s/%s][ver%s] Sampling and writing the configuration file to %s\n" % (i+1, num_models, ver, config_file_path))
+        if arch.name in approximate_configs:
+          approximate_config = approximate_configs[arch.name]
+        elif "default" in approximate_configs:
+          approximate_config = approximate_configs["default"]
+        else:
+          approximate_config = None
+        if no_nonbool_preservation:
+          approximate_config = None
+        new_model_sampler = Klocalizer.Z3ModelSampler(full_constraints,
+                                                      approximate_constraints=approximate_config,
+                                                      random_seed=random_seed + ver,
+                                                      logger=logger)
+        is_sat, new_model = new_model_sampler.sample_model()
+        assert is_sat
+        config_content = Klocalizer.get_config_from_model(new_model, arch, set_tristate_m=modules_arg, allow_non_visibles=allow_non_visibles, approximate_config=approximate_config)
+        with open(config_file_path, 'w') as f:
+          f.write(config_content)
+
+        built_mutex_units = []  # Use for logging the build command
+        for unit, lines in original_include_mutex_list:
+          if unit in coverage:
+            built_mutex_units.append(unit)
+            coverage_report[unit]["unit"].append(config_basename)
+          for l in lines:
+            if l in global_scope_lines.get(unit, []) and unit in coverage:
+              coverage_report[unit][l].append(config_basename)
+            elif unit in coverage and l in coverage[unit]:
+              coverage_report[unit][l].append(config_basename)
+
+        build_cmd = "KCONFIG_CONFIG=%s %s ARCH=%s olddefconfig clean %s" % (config_file_path, cross_compiler, arch.name, " ".join([u for u, _ in include_list] + built_mutex_units))
+        logger.info("Build with \"%s\"\n" % build_cmd)
 
     # Compute coverage report summary
     num_target_files = 0
@@ -1740,5 +1957,10 @@ if __name__ == '__main__':
   except SuperC.SuperC_ChecksFailed as e:
     logger.error("SuperC checks failed, reason: %s.  "
                  "Either fix the issue or omit the line requirements.\n" % (e.reason))
+  finally:
+    # This block will run even if klocalizerCLI() calls exit()
+    if start_time is not None:
+      import time
+      logger.info(f"Total time elapsed for Algorithm 1: {time.time() - start_time:.2f} seconds\n")
   
   exit(0)

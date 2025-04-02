@@ -1,3 +1,4 @@
+import shutil
 import sys
 import os
 import argparse
@@ -14,6 +15,7 @@ import enum
 import z3
 import time
 import fnmatch
+import concurrent.futures
 from functools import reduce
 from kmax.arch import Arch
 from kmax.common import get_kmax_constraints, unpickle_kmax_file
@@ -121,6 +123,7 @@ class Klocalizer:
 
     self.unmet_free = False
     self.unmet_free_except_for = []
+
   
   def set_logger(self, logger):
     """Set logger.
@@ -327,7 +330,234 @@ class Klocalizer:
       if resolved_filename == unit:
         kbuild_paths.append(key)
     return kbuild_paths
-  
+
+  def is_unbootable_config(
+          self,
+          current_config_paths: dict,     # e.g. {"linux_0": "/path/to/current_0.config", ...}
+          arch: str = "x86_64",
+          start: int = 0,
+          end: int = 2,
+          timeout: int = 300
+  ) -> bool:
+    """
+    Returns True if none of the clones (linux_0, linux_1, ..., linux_end)
+    boot successfully (i.e., kernel never boots).
+    Otherwise returns False (meaning at least one clone is bootable).
+
+    :param current_config_paths: dict mapping clone labels ("linux_0", ...) to .config paths
+    :param arch: e.g. "x86_64"
+    :param start: index of first clone
+    :param end: index of last clone (inclusive)
+    :param timeout: QEMU boot timeout
+    """
+
+    main_ksrc_abs = os.path.abspath(self.__ksrc)
+    backup_src = os.path.join(main_ksrc_abs, "linuxbackup")
+    if not os.path.exists(backup_src):
+      raise FileNotFoundError(f"linuxbackup directory not found at {backup_src}")
+
+    # Figure out how many clones we need
+    clones = {}
+    for i in range(start, end + 1):
+      label = f"linux_{i}"
+      clone_dir = os.path.join(main_ksrc_abs, label)
+      clones[label] = clone_dir
+
+      if os.path.exists(clone_dir):
+        # If it already exists, just clean it
+        self.__logger.info(f"[{label}] Directory {clone_dir} exists; cleaning...\n")
+        run(["make", "mrproper"], cwd=clone_dir, timeout=300)
+      else:
+        # Otherwise, do a *full* copy from linuxbackup
+        self.__logger.info(f"[{label}] Copying {backup_src} => {clone_dir}...\n")
+        shutil.copytree(backup_src, clone_dir)
+
+    def clean_build(work_dir, tester_label):
+      self.__logger.info(f"[{tester_label}] [{work_dir}] Cleaning previous build artifacts...\n")
+      try:
+        stdout, stderr, return_code, elapsed = run(["make", "clean"], cwd=work_dir, timeout=120)
+      except Exception as e:
+        self.__logger.error(f"[{tester_label}] [{work_dir}] Error during make clean: {e}\n")
+
+    def build_kernel(work_dir, tester_label):
+      self.__logger.info(f"[{tester_label}] [{work_dir}] Starting kernel build...\n")
+      try:
+        stdout, stderr, return_code, elapsed = run(
+          "make -j$(nproc --ignore=2)",
+          shell=True,
+          cwd=work_dir,
+          timeout=900
+        )
+
+        # If stdout/stderr are strings, encode them; if they are bytes, leave them as-is
+        if isinstance(stdout, str):
+          stdout_b = stdout.encode()
+        else:
+          stdout_b = stdout
+        if isinstance(stderr, str):
+          stderr_b = stderr.encode()
+        else:
+          stderr_b = stderr
+
+        build_log_path = os.path.join(work_dir, "build.log")
+        with open(build_log_path, "wb") as f:
+          f.write(stdout_b + stderr_b)
+
+        if return_code == 0 and b"arch/x86/boot/bzImage is ready" in stdout_b:
+          self.__logger.info(f"[{tester_label}] [{work_dir}] Build succeeded!\n")
+          return True
+        else:
+          self.__logger.warning(f"[{tester_label}] [{work_dir}] Build failed. See {build_log_path}\n")
+          return False
+      except Exception as e:
+        self.__logger.error(f"[{tester_label}] [{work_dir}] Build encountered an exception: {e}\n")
+        return False
+
+    def clean_boot_log(work_dir):
+      boot_log_path = os.path.join(work_dir, "boot.log")
+      if os.path.exists(boot_log_path):
+        try:
+          with open(boot_log_path, "rb") as f:
+            return f.read()
+        except Exception as e:
+          self.__logger.error(f"Error reading boot log in {work_dir}: {e}\n")
+          return b""
+      return b""
+
+    def check_bootability(work_dir, tester_label):
+      # Sample mapping to QEMU images
+      tester_image_paths = {
+        "linux_0": "/home/alexei/Miscellaneous/debian_images/krepair_bootability/bullseye_testerA/bullseye.img",
+        "linux_1": "/home/alexei/Miscellaneous/debian_images/krepair_bootability/bullseye_testerB/bullseye.img",
+        "linux_2": "/home/alexei/Miscellaneous/debian_images/krepair_bootability/bullseye_testerC/bullseye.img"
+      }
+      tester_image = tester_image_paths.get(tester_label)
+      if not tester_image or not os.path.exists(tester_image):
+        self.__logger.warning(f"[{tester_label}] Disk image not found; skipping QEMU boot test.\n")
+        return False
+
+      self.__logger.info(f"[{tester_label}] [{work_dir}] Checking kernel boot with QEMU using: {tester_image}\n")
+      qemu_cmd = [
+        "qemu-system-x86_64", "-m", "2G", "-smp", "2",
+        "-kernel", "arch/x86/boot/bzImage",
+        "-append", "console=ttyS0 root=/dev/sda earlyprintk=serial net.ifnames=0",
+        "-drive", f"file={tester_image},format=raw",
+        "-net", "user", "-net", "nic,model=e1000",
+        "-enable-kvm", "-nographic"
+      ]
+
+      boot_log_path = os.path.join(work_dir, "boot.log")
+      try:
+        with open(boot_log_path, "wb") as boot_log:
+          qemu_proc = subprocess.Popen(qemu_cmd, cwd=work_dir, stdout=boot_log, stderr=subprocess.STDOUT)
+      except Exception as e:
+        self.__logger.error(f"[{tester_label}] [{work_dir}] Failed to launch QEMU: {e}\n")
+        return False
+
+      check_interval = 20
+      elapsed_time = 0
+      self.__logger.info(f"[{tester_label}] [{work_dir}] Waiting for kernel boot...\n")
+
+      try:
+        while qemu_proc.poll() is None:
+          time.sleep(check_interval)
+          elapsed_time += check_interval
+          boot_log_content = clean_boot_log(work_dir)
+
+          # Look for success/failure markers
+          if b"syzkaller login:" in boot_log_content:
+            self.__logger.info(f"[{tester_label}] [{work_dir}] Booted successfully!\n")
+            qemu_proc.terminate()
+            qemu_proc.wait()
+            return True
+          elif b"Kernel panic" in boot_log_content:
+            self.__logger.warning(f"[{tester_label}] [{work_dir}] Kernel panic encountered.\n")
+            qemu_proc.terminate()
+            qemu_proc.wait()
+            return False
+          elif b"qemu: could not open" in boot_log_content:
+            self.__logger.warning(f"[{tester_label}] [{work_dir}] QEMU could not open bzImage.\n")
+            qemu_proc.terminate()
+            qemu_proc.wait()
+            return False
+          elif b"You are in emergency mode." in boot_log_content:
+            self.__logger.warning(f"[{tester_label}] [{work_dir}] Kernel is in emergency mode.\n")
+            qemu_proc.terminate()
+            qemu_proc.wait()
+            return False
+
+          if elapsed_time >= timeout:
+            self.__logger.warning(f"[{tester_label}] [{work_dir}] Boot test timed out.\n")
+            qemu_proc.terminate()
+            qemu_proc.wait()
+            return False
+      except Exception as e:
+        self.__logger.error(f"[{tester_label}] [{work_dir}] Exception during boot check: {e}\n")
+        try:
+          qemu_proc.terminate()
+          qemu_proc.wait()
+        except Exception:
+          pass
+        return False
+
+      self.__logger.info(f"[{tester_label}] [{work_dir}] Boot test ended without success.\n")
+      return False
+
+    def test_config_on_clone(clone_dir, tester_label):
+      """
+      Called in parallel for each clone. Copies the .config from
+      current_config_paths[tester_label] => clone_dir/.config,
+      then attempts to build + boot.
+      """
+      self.__logger.info(f"[{tester_label}] [{clone_dir}] Testing config...\n")
+      try:
+        # Thorough clean
+        run(["make", "mrproper"], cwd=clone_dir, timeout=180)
+
+        # Copy from SAT-check snippet's config file => .config
+        src_config = os.path.abspath(current_config_paths[tester_label])
+        dest_config = os.path.join(clone_dir, ".config")
+        shutil.copy(src_config, dest_config)
+
+        # Then fill in defaults
+        run(["make", "olddefconfig"], cwd=clone_dir, timeout=90)
+
+        # Build
+        clean_build(clone_dir, tester_label)
+        if not build_kernel(clone_dir, tester_label):
+          #archive_logs(clone_dir, tester_label)
+          return False
+
+        # Boot test
+        success = check_bootability(clone_dir, tester_label)
+        #archive_logs(clone_dir, tester_label)
+        return success
+
+      except Exception as e:
+        self.__logger.error(f"[{tester_label}] [{clone_dir}] test_config_on_clone exception: {e}\n")
+        return False
+
+    # Run in parallel
+    clone_count = end - start + 1
+    results = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=clone_count) as executor:
+      future_map = {
+        executor.submit(test_config_on_clone, clones[label], label): label
+        for label in clones
+      }
+      for future in concurrent.futures.as_completed(future_map):
+        c_label = future_map[future]
+        try:
+          outcome = future.result()
+          results[c_label] = outcome
+        except Exception as e:
+          self.__logger.error(f"[{c_label.upper()}] Exception in parallel test: {e}\n")
+          results[c_label] = False
+
+    self.__logger.info(f"Boot test results: {results}\n")
+    # If ANY is True => bootable => return False for "unbootable"
+    return not any(results.values())
+
   @staticmethod
   def get_config_file_constraints(config_file):
     """Given a path to a Kconfig configuration file, parse and return the list
@@ -560,6 +790,7 @@ class Klocalizer:
     
     return "".join(configfile_content)
 
+
   @staticmethod
   def get_kclause_cache_url(linux_tag_version):
     """Get the URL that holds the index to the cached formula's for the given linux version tag."""
@@ -599,6 +830,10 @@ class Klocalizer:
 
       # keep this to remember if sat check is done or not
       self.__is_sat = None
+
+      print(f"Z3ModelSampler configuration:")
+      print(f"  random_seed: {random_seed}")
+      print(f"  approximate_constraints: {len(self.__approximate_constraints) if self.__approximate_constraints else 'None'}")
     
     def set_logger(self, logger):
       """Set logger.
@@ -616,7 +851,7 @@ class Klocalizer:
           assert m in dir(logger)
         
         self.__logger = logger
-      
+
     def __approximate_model(self):
       """Assumptions:
         * the constraints are already sat.
@@ -633,23 +868,52 @@ class Klocalizer:
       assumptions = self.__approximate_constraints
       solver.add(self.__constraints)
 
+      # Add debug to __approximate_model method
+      print(f"Approximating model with {len(self.__approximate_constraints)} constraints")
+
       is_sat = solver.check(assumptions) == z3.sat
       if is_sat:
         self.__logger.info("Already satisfiable when constraining with given config.  No approximatation needed.\n")
       else:
+        core = solver.unsat_core()
+        print(f"[DEBUG] Unsat core size: {len(core)}")
+        if len(core) > 0:
+          print(f"[DEBUG] First few core constraints: {[str(c) for c in list(core)[:5]]}")
+
         self.__logger.info("Approximating via unsat core approach.\n")
         total_assumptions_to_match = len(assumptions)
         self.__logger.debug("%d assumptions left to try removing.\r" % (total_assumptions_to_match))
+
+        iteration = 0
+        removed_count = 0
+
         while not is_sat:
+          iteration += 1
           core = solver.unsat_core()
-          # remove all assumptions that in the core, except those specifically given as user-constraints.  potential optmization: try randomizing this or removing only some assumptions each iteration.
-          # print(core)
-          # update: user-constraints are no longer handled differently
-          assumptions = [ assumption for assumption in assumptions if assumption not in core ]
+
+          # Print each unsat core iteration
+          print(f"[DEBUG] Unsat core iteration {iteration}, size: {len(core)}")
+          if len(core) > 0:
+            print(f"[DEBUG] First few core constraints: {[str(c) for c in list(core)[:5]]}")
+
+          # Count how many assumptions are being removed
+          before_len = len(assumptions)
+
+          # remove all assumptions that in the core, except those specifically given as user-constraints.
+          assumptions = [assumption for assumption in assumptions if assumption not in core]
+
+          after_len = len(assumptions)
+          removed_this_iteration = before_len - after_len
+          removed_count += removed_this_iteration
+
+          print(f"[DEBUG] Removed {removed_this_iteration} assumptions in this iteration, {removed_count} total so far")
+
           self.__logger.debug("%s\r" % len(assumptions))
           is_sat = solver.check(assumptions) == z3.sat
+
         self.__logger.debug("\r")
         self.__logger.info("Found satisfying config by removing %d assumptions.\n" % (total_assumptions_to_match - len(assumptions)))
+        print(f"[INFO] Found satisfying config by removing {removed_count} assumptions.")
 
     def sample_model(self):
       """If sat, return (True, z3_model)
