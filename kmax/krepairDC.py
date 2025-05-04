@@ -60,21 +60,21 @@ class krepairDivQ:
     DECL_PATTERN = re.compile(r"(CONFIG_[A-Z0-9_]+)")  # compile once for efficiency
 
     def __init__(self, linux_ksrc: str, existing_config_path: str):
-        self.complex_arch_constraints = []
+        self.linux_ksrc = linux_ksrc  # Path to the Linux kernel source directory
         self.arch_smt2_str = ""
+        self.parsed_arch_constraints = None  # Parsed Z3 constraints for architecture
+        self.arch_baseline_solver = None  # Solver for architecture-specific constraints
+
         self.dependency_graph = nx.DiGraph()
-        self.unbootable_options = set()
-        self.linux_ksrc = linux_ksrc
-        self.patch_constraints = []
-        self.patch_constraints_seen = set()
-        self.patch_declarations = set()
-        self.unit_constraints = defaultdict(list)
-        self.arch_baseline_solver = None
-        self.parsed_arch_constraints = None
-        self.existing_config_path = existing_config_path
-        # Initialize existing_config_constraints before building declarations:
+        self.unbootable_options = set() # about to be axed
+
+        self.patch_constraints = []  # List of patch constraints (SMT2 strings)
+        self.patch_declarations = set()  # Set of SMT2 declarations for configuration symbols
+        self.unit_constraints = defaultdict(list)  # Maps unit names to lists of patch constraints
+
+        self.merged_groups = {}  # Merged groups of constraints
+        self.existing_config_path = existing_config_path  # Path to the existing .config file
         self.existing_config_constraints = []  # Stores constraints from .config
-        self.merged_groups = {}
         self.build_all_declarations()
 
     def build_all_declarations(self):
@@ -96,10 +96,12 @@ class krepairDivQ:
         self.patch_declarations = {f"(declare-const {token} Bool)" for token in tokens}
         print(f"Cached {len(self.patch_declarations)} declarations.")
 
-    def get_arch_constraints(self, arch_name: str = "x86_64"):
-        """Get arch constraints using existing functionality"""
+    def get_complex_arch_constraints(self, arch_name: str = "x86_64", output_file: str = None):
+        """
+        this method builds a giant smt2 string and stores it in self.arch_smt2_str.
+        instead of parsing to z3 objects, we keep it as text to avoid pickling errors.
+        """
         try:
-            # Initialize Arch object
             self.arch = Arch(
                 arch_name,
                 linux_ksrc=self.linux_ksrc,
@@ -109,55 +111,13 @@ class krepairDivQ:
                 loggerLevel=logging.INFO
             )
 
-            kclause_path = os.path.join(get_arch_formulas_dir(self.linux_ksrc, arch_name), 'kclause')
-            print(f"Looking for kclause at: {kclause_path}")
-
+            # 1) load raw constraints (pickled) from 'kclause_path'
+            kclause_path = os.path.join(self.linux_ksrc, f"{arch_name}_formulas.pkl", 'kclause')
             if not os.path.exists(kclause_path) or os.path.getsize(kclause_path) == 0:
                 print("Kclause file missing or empty, generating...")
                 self.arch.generate_kclause()
             else:
                 print(f"Found existing kclause file ({os.path.getsize(kclause_path)} bytes)")
-
-            # Try to load the constraints directly using pickle
-            try:
-                with open(kclause_path, 'rb') as f:
-                    self.compiled_arch_constraints = pickle.load(f)
-            except Exception as e:
-                print(f"Error loading kclause file directly: {e}")
-                # Fallback to regenerating constraints
-                self.compiled_arch_constraints = self.arch.load_kclause(
-                    kclause_file=kclause_path,
-                    is_composite=True
-                )
-
-            # Convert compiled_arch_constraints into Z3 expressions
-            self.arch_constraints = []
-            for constraint in self.compiled_arch_constraints:
-                if isinstance(constraint, str):
-                    # Convert strings to Z3 variables directly
-                    z3_var = z3.Bool(constraint)
-                    self.arch_constraints.append(z3_var)
-                else:
-                    self.arch_constraints.append(constraint)
-
-            print(f"Successfully loaded {len(self.arch_constraints)} arch constraints")
-
-        except Exception as e:
-            print(f"Error in arch constraints processing: {e}")
-            self.compiled_arch_constraints = []
-            self.arch_constraints = []
-
-    def get_complex_arch_constraints(self, arch_name: str = "x86_64", output_file: str = None):
-        """
-        this method builds a giant smt2 string and stores it in self.arch_smt2_str.
-        instead of parsing to z3 objects, we keep it as text to avoid pickling errors.
-        """
-        try:
-            # 1) load raw constraints (pickled) from 'kclause_path'
-            kclause_path = os.path.join(self.linux_ksrc, f"{arch_name}_formulas.pkl", 'kclause')
-            if not os.path.exists(kclause_path) or os.path.getsize(kclause_path) == 0:
-                print("kclause file missing or empty, generating... (omitted here)")
-                return
 
             with open(kclause_path, 'rb') as f:
                 raw_constraints = pickle.load(f)
@@ -233,67 +193,33 @@ class krepairDivQ:
             self.arch_smt2_str = ""
 
     def init_arch_baseline_solver(self):
-        """
-        Initialize a baseline solver that contains the full arch constraints,
-        including extra architecture-specific assertions for x86_64.
-        This is done once so we avoid repeatedly parsing the arch constraints.
-        """
         try:
-            # Create a new context and solver for the arch constraints.
+            # Build one dedicated context/solver for arch constraints
             self.arch_ctx = z3.Context()
             self.arch_baseline_solver = z3.Solver(ctx=self.arch_ctx)
 
-            if self.arch_smt2_str and self.arch_smt2_str.strip():
-                # Parse the combined arch constraints from arch_smt2_str.
-                arch_exprs = list(z3.parse_smt2_string(self.arch_smt2_str, ctx=self.arch_ctx))
-
-                # If the architecture is x86_64, add extra architecture-specific assertions.
-                if self.arch.name == "x86_64":
-                    extra_decls = []
-                    extra_assertions = []
-                    # Define extra assertions as pairs (constant, assertion).
-                    extra_pairs = [
-                        ("CONFIG_X86", "(assert CONFIG_X86)"),
-                        ("CONFIG_X86_64", "(assert CONFIG_X86_64)"),
-                        ("CONFIG_X86_32", "(assert (not CONFIG_X86_32))"),
-                        ("BITS==64", "(assert BITS==64)"),
-                        ("BITS==32", "(assert (not BITS==32))")
-                    ]
-                    for const, assertion in extra_pairs:
-                        extra_decls.append(f"(declare-const {const} Bool)")
-                        extra_assertions.append(assertion)
-
-                    # Negative assertions for all other architectures.
-                    other_archs = [
-                        "ALPHA", "ARC", "ARM", "ARM64", "C6X", "CSKY", "H8300", "HEXAGON", "IA64",
-                        "LOONGARCH", "M68K", "MICROBLAZE", "MIPS", "NDS32", "NIOS2", "OPENRISC",
-                        "PARISC", "PPC", "PPC32", "PPC64", "RISCV", "S390", "SPARC", "SPARC32",
-                        "SPARC64", "SUPERH", "SUPERH32", "SUPERH64", "UML", "UNICORE32", "XTENSA"
-                    ]
-                    for arch in other_archs:
-                        const = f"CONFIG_{arch}"
-                        extra_decls.append(f"(declare-const {const} Bool)")
-                        extra_assertions.append(f"(assert (not {const}))")
-                    # Add the extra assertion for CONFIG_BROKEN.
-                    extra_decls.append("(declare-const CONFIG_BROKEN Bool)")
-                    extra_assertions.append("(assert (not CONFIG_BROKEN))")
-
-                    # Build a string that combines the declarations and assertions.
-                    extra_arch_str = "(set-logic QF_UF)\n" + "\n".join(extra_decls + extra_assertions)
-                    try:
-                        extra_arch_exprs = list(z3.parse_smt2_string(extra_arch_str, ctx=self.arch_ctx))
-                        arch_exprs.extend(extra_arch_exprs)
-                    except Exception as e:
-                        print(f"[ERROR] Failed to parse extra arch constraints: {e}")
-                        raise
-
-                # Add all the architecture constraints to the baseline solver.
-                self.arch_baseline_solver.add(arch_exprs)
-                print(f"[debug] arch baseline solver initialized with {len(arch_exprs)} constraints")
-            else:
+            if not (self.arch_smt2_str and self.arch_smt2_str.strip()):
                 print("[debug] arch_smt2_str is empty; arch baseline solver not initialized")
+                return
+
+            # 1) whatever constraints you already had, parsed into self.arch_ctx
+            arch_exprs = list(
+                z3.parse_smt2_string(self.arch_smt2_str, ctx=self.arch_ctx)
+            )
+
+            # 2) pull the per‑arch extras (they are in the *default* ctx)
+            extra_exprs = [
+                e.translate(self.arch_ctx)                # copy into the right ctx
+                for e in self.arch.get_arch_specific_constraints()
+            ]
+            arch_exprs.extend(extra_exprs)
+
+            # 3) add everything
+            self.arch_baseline_solver.add(arch_exprs)
+            print(f"[debug] arch baseline solver initialized with {len(arch_exprs)} constraints")
+
         except Exception as e:
-            print(f"error initializing arch baseline solver: {e}")
+            print(f"[error] initializing arch baseline solver: {e}")
             self.arch_baseline_solver = None
 
     def build_kconfig_dependency_graph(self, content):
@@ -492,6 +418,12 @@ class krepairDivQ:
         Skips lines that contain leftover "(declare-const", "(assert", or "(check-sat)"
         to avoid re-parsing old solver lines.
         """
+
+        seen = set()
+        self.patch_constraints = []
+        self.unit_constraints = defaultdict(list)
+        self.unit_configs = defaultdict(set)
+
         def strip_defined_expressions(line: str) -> str:
             """
             Replaces (defined X) or |(defined X)| with just X.
@@ -575,10 +507,10 @@ class krepairDivQ:
                     return
 
             assertion_str = f"(assert {expr_str})"
-            if assertion_str not in self.patch_constraints_seen:
+            if assertion_str not in seen:
+                seen.add(assertion_str)
                 self.patch_constraints.append(assertion_str)
                 self.unit_constraints[current_unit].append(assertion_str)
-                self.patch_constraints_seen.add(assertion_str)
                 for c in configs:
                     self.unit_configs[current_unit].add(c)
 
@@ -638,12 +570,6 @@ class krepairDivQ:
         ##########################
         current_unit = None
         block_lines = []
-
-        # Clear out previous parse results
-        self.unit_constraints = defaultdict(list)
-        self.unit_configs = defaultdict(set)
-        self.config_vars_cache = {}
-        # self.patch_constraints, self.patch_declarations presumably are in __init__ or so
 
         def flush_block():
             nonlocal block_lines, current_unit
@@ -886,7 +812,7 @@ class krepairDivQ:
         all_constraints_flat = [normalize_constraint(c) for chunk in chunks for c in chunk]
         duplicates = [c for c, count in Counter(all_constraints_flat).items() if count > 1]
         if duplicates:
-            print(f"🚨 WARNING: Detected {len(duplicates)} duplicate constraints!")
+            print(f" WARNING: Detected {len(duplicates)} duplicate constraints!")
             for d in duplicates[:10]:
                 print(f"  - {d}")
 
@@ -1169,9 +1095,9 @@ class krepairDivQ:
              until no further merges are possible.
           2. Merge-As-Much-As-Possible – general merge phase.
 
-        When first_phase_only is True, Phase 1 runs until no adjacent merges occur,
-        then Phase 2 runs for one iteration (if any merge occurs) to allow for temp_unsat processing.
-        When first_phase_only is False, Phase 1 is skipped entirely.
+        When first_phase_only is True, Phase-1 runs until no adjacent merges occur,
+        then Phase-2 runs for one iteration (if any merge occurs) to allow for temp_unsat processing.
+        When first_phase_only is False, Phase-1 is skipped entirely.
         """
         from collections import defaultdict
         tried_chunks = defaultdict(set)
@@ -1390,7 +1316,6 @@ class krepairDivQ:
                 print("[ERROR] arch_baseline_solver still None; cannot test satisfiability.")
                 return False
 
-        import z3
         # Create a new solver in the same context as the baseline solver.
         cloned_solver = z3.Solver(ctx=self.arch_baseline_solver.ctx)
 
@@ -1609,10 +1534,10 @@ class krepairDivQ:
         return constraints
 
 def process_complete_smt_script(
-        full_script,            # chunk-level smt text (with declare-const, etc.)
+        full_script,
         chunk_idx,
         global_indexes,
-        local_constraints,      # the slice of constraints for this chunk
+        local_constraints,
         all_constraints,
         arch_smt2_str,
         shared_data,
@@ -1622,169 +1547,99 @@ def process_complete_smt_script(
     """
     Optimized version that uses a single solver per worker (per chunk) and
     push/pop to test each constraint incrementally. If a constraint causes
-    unsat, we pop it and record it in temp_unsat (no separate unsat-solver).
+    unsat, we pop it and record it in temp_unsat.
     """
-
     chunk_id = chunk_idx + 1
     print(f"\n=== Processing chunk {chunk_id} ===")
 
-    # Will store indexes of constraints that prove satisfiable when added
     valid_indexes = []
-    # Will store constraint strings that cause unsat
     temp_unsat = []
-
-    # Map from global index -> local index
-    global_to_local = {global_idx: local_idx for local_idx, global_idx in enumerate(global_indexes)}
+    global_to_local = {g: i for i, g in enumerate(global_indexes)}
 
     try:
-        # ----------------------------------------------------------------
-        # 1) Build a baseline solver with arch constraints and declarations
-        # ----------------------------------------------------------------
+        # 1) Build a fresh context and solver
         ctx = z3.Context()
         solver = z3.Solver(ctx=ctx)
 
-        # --- 1.1) Parse and add architecture constraints ---
+        # 1.1) parse & add the baked‑in arch_smt2_str
         if arch_smt2_str and arch_smt2_str.strip():
-            try:
-                arch_exprs = z3.parse_smt2_string(arch_smt2_str, ctx=ctx)
-                solver.add(arch_exprs)
-                print(f"Debug: Parsed {len(arch_exprs)} arch constraints into baseline solver.")
-            except Exception as e:
-                print(f"Error parsing arch_smt2_str in worker: {e}")
-                return [], [], chunk_id
+            arch_exprs = z3.parse_smt2_string(arch_smt2_str, ctx=ctx)
+            solver.add(arch_exprs)
+            print(f"Debug: Parsed {len(arch_exprs)} arch constraints into baseline solver.")
         else:
             print("Debug: arch_smt2_str is empty, no arch constraints added.")
 
-        # --- 1.2) Add extra arch-specific assertions in the worker (e.g., for x86_64) ---
-        if arch_name == "x86_64":
-            other_archs = [
-                "ALPHA", "ARC", "ARM", "ARM64", "C6X", "CSKY", "H8300", "HEXAGON", "IA64",
-                "LOONGARCH", "M68K", "MICROBLAZE", "MIPS", "NDS32", "NIOS2", "OPENRISC",
-                "PARISC", "PPC", "PPC32", "PPC64", "RISCV", "S390", "SPARC", "SPARC32",
-                "SPARC64", "SUPERH", "SUPERH32", "SUPERH64", "UML", "UNICORE32", "XTENSA"
-            ]
-            extra_arch_str = "(set-logic QF_UF)\n" + "\n".join([
-                "(declare-const CONFIG_X86 Bool)",
-                "(declare-const CONFIG_X86_64 Bool)",
-                "(declare-const CONFIG_X86_32 Bool)",
-                "(declare-const BITS_64 Bool)",
-                "(declare-const BITS_32 Bool)",
-                "(declare-const CONFIG_BROKEN Bool)",
-                "(assert CONFIG_X86)",
-                "(assert CONFIG_X86_64)",
-                "(assert (not CONFIG_X86_32))",
-                "(assert BITS_64)",
-                "(assert (not BITS_32))"
-            ])
-            # Add negative assertions for other architectures
-            for arch in other_archs:
-                extra_arch_str += f"\n(declare-const CONFIG_{arch} Bool)"
-                extra_arch_str += f"\n(assert (not CONFIG_{arch}))"
-            # Finally, assert that CONFIG_BROKEN is not set.
-            extra_arch_str += "\n(assert (not CONFIG_BROKEN))"
+        # 1.2) pull in *all* per‑arch constraints via the helper
+        arch = Arch(arch_name)
+        extra_arch_exprs = [
+            expr.translate(ctx) for expr in arch.get_arch_specific_constraints()
+        ]
+        solver.add(extra_arch_exprs)
+        print(f"Debug: Added {len(extra_arch_exprs)} arch‑specific assertions from helper.")
 
-            try:
-                extra_exprs = z3.parse_smt2_string(extra_arch_str, ctx=ctx)
-                solver.add(extra_exprs)
-                print(f"Debug: Added {len(extra_exprs)} extra arch-specific assertions in worker.")
-            except Exception as e:
-                print(f"Error adding extra arch assertions in worker: {e}")
-
-        # --- 1.3) Parse patch declarations from full_script and add them ---
-        declarations = sorted(patch_declarations)
-        if declarations:
-            decl_script = "\n".join(["(set-logic QF_UF)"] + declarations)
-            try:
-                parsed_decls = z3.parse_smt2_string(decl_script, ctx=ctx)
-                solver.add(parsed_decls)
-                print(f"Debug: Parsed {len(parsed_decls)} declarations.")
-            except Exception as e:
-                print(f"Declaration context error: {str(e)[:200]}")
-                return [], [], chunk_id
+        # 1.3) parse & add your patch‑level declarations
+        if patch_declarations:
+            decl_script = "\n".join(["(set-logic QF_UF)"] + sorted(patch_declarations))
+            parsed_decls = z3.parse_smt2_string(decl_script, ctx=ctx)
+            solver.add(parsed_decls)
+            print(f"Debug: Parsed {len(parsed_decls)} declarations.")
         else:
             print("Debug: No patch declarations found.")
 
-        # ----------------------------------------------------------------
-        # 2) Process patch constraints one-by-one via push/pop
-        # ----------------------------------------------------------------
+        # 2) push/pop through each constraint
         print(f"Debug: Processing {len(local_constraints)} patch constraints...")
-
         for idx, constraint_str in enumerate(local_constraints):
             current_index = global_indexes[idx]
-
-            # Update shared counter (used by the main process for progress)
             if shared_data is not None:
                 shared_data.counter += 1
-                if (idx + 1) % 10 == 0:  # debug print every 10 constraints
+                if (idx + 1) % 10 == 0:
                     print(f"Worker {os.getpid()} processed {shared_data.counter} constraints.")
 
             print(f"Processing constraint {idx}: {constraint_str.strip()}")
-
+            solver.push()
             try:
-                # We'll push the current solver state,
-                # add the new constraint, check, pop if unsat.
-                solver.push()
-
-                # Parse and add the new constraint
-                constraint_script = "\n".join([
-                    "(set-logic QF_UF)",
-                    *declarations,
-                    constraint_str
-                ])
-                parsed_constraint = z3.parse_smt2_string(constraint_script, ctx=ctx)
-                if not parsed_constraint:
-                    print(f"Empty parse result for constraint {idx}, skipping.")
+                # include declarations so symbols are in scope
+                script = "\n".join(["(set-logic QF_UF)"] +
+                                   sorted(patch_declarations) +
+                                   [constraint_str])
+                parsed_c = z3.parse_smt2_string(script, ctx=ctx)
+                if not parsed_c:
                     solver.pop()
                     continue
 
-                solver.add(parsed_constraint)
-
-                # Check satisfiability with the newly added constraint
-                result = solver.check()
-                if result == z3.sat:
-                    # It's valid, so we keep it permanently (do NOT pop)
+                solver.add(parsed_c)
+                res = solver.check()
+                if res == z3.sat:
                     valid_indexes.append(current_index)
                     print(f"Constraint {idx} is satisfiable, keeping it.")
-                elif result == z3.unsat:
-                    # The new constraint is unsatisfiable with the existing set
-                    # We pop() to remove it
-                    solver.pop()
-                    temp_unsat.append(constraint_str)
-                    print(f"Constraint {idx} causes unsat, removing it.")
                 else:
-                    # If it's unknown or any other status, we also pop
                     solver.pop()
                     temp_unsat.append(constraint_str)
-                    print(f"Constraint {idx} returned UNKNOWN, skipping.")
-
+                    print(f"Constraint {idx} causes {res}, removing it.")
             except Exception as e:
-                # If there's a parse or solver error, pop and record in temp_unsat
-                print(f"Constraint parse/check error ({idx}): {str(e)[:200]}")
                 solver.pop()
                 temp_unsat.append(constraint_str)
-                continue
+                print(f"Constraint error ({idx}): {e}")
 
-        # ----------------------------------------------------------------
-        # 3) Build final return lists of valid constraints
-        # ----------------------------------------------------------------
-        final_local_constraints = []
-        final_global_indexes = []
+        # 3) collect final lists
+        final_local = []
+        final_globals = []
         for gidx in valid_indexes:
-            local_idx = global_to_local[gidx]
-            final_local_constraints.append(local_constraints[local_idx])
-            final_global_indexes.append(gidx)
+            li = global_to_local[gidx]
+            final_local.append(local_constraints[li])
+            final_globals.append(gidx)
 
         print(f"Processed {len(local_constraints)} constraints in chunk {chunk_id}.")
-        return final_global_indexes, temp_unsat, chunk_id, final_local_constraints
+        return final_globals, temp_unsat, chunk_id, final_local
 
     except Exception as e:
-        print(f"Critical failure in chunk {chunk_id}: {str(e)[:200]}")
-        return [], [], chunk_id
+        print(f"Critical failure in chunk {chunk_id}: {e}")
+        return [], [], chunk_id, []
 
 
 def main():
 
-    linux_ksrc = "/home/alexei/LinuxKernels/krepair_bootability/full_attempts/linux_set30_a_krepairDC"
+    linux_ksrc = "/home/alexei/LinuxKernels/krepair_alg/pre-study-fixes/linux_300commitset_copy"
     existing_config_file = f"{linux_ksrc}/.config"
     unbootable_options_file = "/home/alexei/LinuxKernels/krepair_alg/linux_set50copy/unbootable_options.txt"
     output_dir = f"{linux_ksrc}/repaired_configs"
@@ -1792,9 +1647,9 @@ def main():
     krepair = krepairDivQ(linux_ksrc, existing_config_path=existing_config_file)
 
     # Get arch constraints
-    krepair.get_arch_constraints("x86_64")
     krepair.get_complex_arch_constraints("x86_64", f"{linux_ksrc}/arch_constraints_x86_64.txt")
 
+    # Start recording amount of time for mutex algorithm (alg 1)
     start_time = time.time()
 
     # Read kextract output
