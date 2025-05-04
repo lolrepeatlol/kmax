@@ -429,7 +429,8 @@ class Klocalizer:
       tester_image_paths = {
         "linux_0": "/home/alexei/Miscellaneous/debian_images/krepair_bootability/bullseye_testerA/bullseye.img",
         "linux_1": "/home/alexei/Miscellaneous/debian_images/krepair_bootability/bullseye_testerB/bullseye.img",
-        "linux_2": "/home/alexei/Miscellaneous/debian_images/krepair_bootability/bullseye_testerC/bullseye.img"
+        "linux_2": "/home/alexei/Miscellaneous/debian_images/krepair_bootability/bullseye_testerC/bullseye.img",
+        "linux_3": "/home/alexei/Miscellaneous/debian_images/krepair_bootability/bullseye_testerD/bullseye.img"
       }
       tester_image = tester_image_paths.get(tester_label)
       if not tester_image or not os.path.exists(tester_image):
@@ -519,6 +520,22 @@ class Klocalizer:
         dest_config = os.path.join(clone_dir, ".config")
         shutil.copy(src_config, dest_config)
 
+        # --- Begin modifications to .config before olddefconfig ---
+        # Open and read the current .config contents
+        with open(dest_config, "r") as f:
+          lines = f.readlines()
+
+        # Write back only the lines that do not contain the unwanted config options
+        with open(dest_config, "w") as f:
+          for line in lines:
+            if "CONFIG_SECURITYFS" in line or "CONFIG_CONFIGFS_FS" in line:
+              continue
+            f.write(line)
+          # Append the required config options
+          f.write("CONFIG_SECURITYFS=y\n")
+          f.write("CONFIG_CONFIGFS_FS=y\n")
+        # --- End modifications to .config ---
+
         # Then fill in defaults
         run(["make", "olddefconfig"], cwd=clone_dir, timeout=90)
 
@@ -555,8 +572,9 @@ class Klocalizer:
           results[c_label] = False
 
     self.__logger.info(f"Boot test results: {results}\n")
-    # If ANY is True => bootable => return False for "unbootable"
-    return not any(results.values())
+
+    # Return True for "unbootable" if 60% or fewer configs boot successfully
+    return not (sum(results.values()) > 0.6 * len(results))
 
   @staticmethod
   def get_config_file_constraints(config_file):

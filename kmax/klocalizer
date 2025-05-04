@@ -6,6 +6,9 @@ import logging
 from kmax.superc import SuperC, SyntaxAnalysis
 from kmax.vcommon import get_build_system_id
 import json
+import random
+import os
+import pathlib
 from collections import OrderedDict
 from kmax import patch
 import pathlib
@@ -34,9 +37,10 @@ class BasicLogger:
   def debug(self, msg):
     if self.verbose: sys.stderr.write("DEBUG: %s" % msg)
 
+
 def klocalizerCLI():
   klocalizer=Klocalizer()
-  
+
   # Parse command line arguments
   argparser = argparse.ArgumentParser()
 
@@ -352,6 +356,8 @@ def klocalizerCLI():
   exit_code_superc_sourcelinepc_failed = 28
     
   sys.stderr.write("klocalizer, %s %s\n" % (kmax.about.__title__, kmax.about.__version__))
+  sys.stderr.write(f"Modules setting: {modules_arg}\n")
+  next_boot_debug_id = 1
 
   def unit2srcfile(unit):
     assert unit.endswith('.c') or unit.endswith('.o')
@@ -794,6 +800,8 @@ def klocalizerCLI():
       logger.debug("Kmax formula file: %s\n" % (kmax_file))
       klocalizer.load_kmax_formulas(kmax_file, is_cache=False)
       is_kmax_cache = False
+
+  global_log_idx = 0
 
   #
   # Simplify line requirements through syntax analysis.
@@ -1291,7 +1299,7 @@ def klocalizerCLI():
         import time
         global start_time
         start_time = time.time()
-    
+
       # Keep track of whether there is an improvement found to the coverage
       # with the accumulated constraints. If not, loop will continue with
       # the next architecture. Otherwise, the loop will give this arch
@@ -1308,6 +1316,9 @@ def klocalizerCLI():
       # in this iteration. At the end of the iteration, this will replace
       # the previous requirements.
       new_requirements = []
+
+      # Initialize set to track constraints that passed boot checks for this arch run.
+      tested_patch_sets = set()  # Set[frozenset[str]]
 
       # Visit requirements.
       if not got_first_improvement:
@@ -1344,12 +1355,11 @@ def klocalizerCLI():
         # duplicate blocks.
         covered_blocks = set()
         cant_cover_blocks = set()
-
-        # Keep track of unbootable blocks.
-        bootability_denylist = set()
+        bootability_denylist = set()  # unbootable blocks
 
         # Check for each line.
         for line in lines:
+          global_log_idx += 1
 
           # Ignore options we've previously deemed unbootable.
           if (unit, line) in bootability_denylist:
@@ -1380,6 +1390,7 @@ def klocalizerCLI():
           # Attempt to build the line
           #
           line_covered = False
+          bootable = False  # assume unbootable
 
           def generate_config_from_constraints(additional_constraints, tester_label, log_idx):
             logger.info(f"Getting config for boot_run{log_idx}_tester{tester_label}\n")
@@ -1389,6 +1400,34 @@ def klocalizerCLI():
             apprx_processed = approximate_constraints.get(arch.name, approximate_constraints.get("default", None))
 
             full_constraints = compiled_arch_constraints + additional_constraints
+
+            ## DEBUGGING
+            # Ensure debug directory exists
+            debug_dir = os.path.join(output_dir, "archive_logs", "debug")
+            pathlib.Path(debug_dir).mkdir(parents=True, exist_ok=True)
+
+            # Safely default apprx_processed to an empty list if None
+            apprx_processed_safe = apprx_processed if apprx_processed is not None else []
+
+            # Write approximate constraints to file
+            apprx_path = os.path.join(debug_dir, f"run{log_idx}_{tester_label}_approximate_constraints.txt")
+            with open(apprx_path, "a") as f:
+                if apprx_processed_safe:
+                    for c in apprx_processed_safe:
+                        f.write(str(c) + "\n")
+                else:
+                    logger.warning("No approximate constraints available for run{log_idx}_tester{tester_label}\n")
+
+            # Write full constraints to file
+            full_path = os.path.join(debug_dir, f"run{log_idx}_{tester_label}_full_constraints.txt")
+            with open(full_path, "a") as f:
+                for c in full_constraints:
+                    f.write(str(c) + "\n")
+
+            ## END DEBUGGING
+
+            # Generate a random seed for each call
+            random_seed = random.randint(1, 1_000_000)
 
             # Use the processed constraints for SAT/model sampling.
             model_sampler = Klocalizer.Z3ModelSampler(
@@ -1437,95 +1476,128 @@ def klocalizerCLI():
 
                 # If the constraints are SAT, then check for bootability.
                 if is_sat:
-                    # Suppose you want 3 clones (indexed 0..2).
-                    num_clones = 3
-                    start_idx = 0
-                    end_idx = num_clones - 1  # i.e., 2
+                    debug_id = next_boot_debug_id
+                    next_boot_debug_id += 1
 
-                    # We'll use a simple counter that increments for each tester in this run.
-                    global_log_idx = 1
+                    # 1) Build the patch‑constraint set
+                    def is_trivial(c):
+                        return (c is True) or z3.is_true(c)
 
-                    # 1) Generate and store the configs in archive_logs.
-                    tester_configs = {}
-                    for i in range(start_idx, end_idx + 1):
-                        tester_label = f"linux_{i}"
-                        # Pass tester_label and current log index into the function.
-                        config = generate_config_from_constraints(constraints_with_line, tester_label, global_log_idx)
-                        tester_configs[tester_label] = config
-                        global_log_idx += 1
-
-                    # We'll store them all in one directory.
-                    temp_config_dir = os.path.join(output_dir, "archive_logs")
-                    pathlib.Path(temp_config_dir).mkdir(parents=True, exist_ok=True)
-
-                    # Keep track of each tester's config path so is_unbootable_config can see it.
-                    config_paths_dict = {}
-
-                    for i in range(start_idx, end_idx + 1):
-                        tester_label = f"linux_{i}"
-                        config_filename = f"current_{i}.config"  # e.g. "current_0.config"
-                        config_path = os.path.join(temp_config_dir, config_filename)
-                        with open(config_path, "w") as f:
-                            f.write(tester_configs[tester_label])
-                        config_paths_dict[tester_label] = config_path
-
-                    # 2) Call is_unbootable_config to build + boot test each clone.
-                    unbootable = klocalizer.is_unbootable_config(
-                        config_paths_dict,
-                        arch=arch.name,
-                        start=start_idx,
-                        end=end_idx
+                    patch_elements = kmax_constraints[unit] + list(line_const)
+                    patch_key = frozenset(
+                        str(c)
+                        for c in patch_elements
+                        if not is_trivial(c)
                     )
 
-                    if unbootable:
-                        logger.warning("Bootability lost for (%s:%s)\n" % (unit, line))
-                        bootability_denylist.add((unit, line))
-                        bootable = False
-                    else:
-                        logger.info("Bootability present for (%s:%s)\n" % (unit, line))
+                    # Show the first 5 constraints from the patch key for debugging
+                    patch_key_sample = list(patch_key)[:5] if patch_key else []
+                    logger.debug(f"BOOT-DEBUG [{debug_id}] - for ({unit}:{line}), patch_key has {len(patch_key)} constraints. First few: {patch_key_sample}\n")
+
+                    skip_boot_check = False
+
+                    # 2) Skip if we’ve seen this exact key already
+                    if patch_key in tested_patch_sets:
+                        logger.info(f"BOOT-DEBUG [{debug_id}] - Skipping boot check for ({unit}:{line}): identical patch constraints seen before.\n")
+                        skip_boot_check = True
                         bootable = True
 
+                    # After a real boot PASS, record *all* of them
+                    if not skip_boot_check:
+                        # Suppose you want 4 clones (indexed 0..3).
+                        num_clones = 4
+                        tester_configs = {}
+                        tester_log_indices = {}  # Map tester label to its unique log index
+
+                        for i in range(num_clones):
+                            # Create a unique tester label that combines the global log index and the clone index.
+                            tester_label = f"linux_{i}"
+                            current_log = global_log_idx  # Capture current global log index for this tester
+                            config = generate_config_from_constraints(constraints_with_line, tester_label, current_log)
+                            tester_configs[tester_label] = config
+                            tester_log_indices[tester_label] = current_log
+
+                        # We'll store them all in one directory.
+                        temp_config_dir = os.path.join(output_dir, "archive_logs")
+                        pathlib.Path(temp_config_dir).mkdir(parents=True, exist_ok=True)
+
+                        # Keep track of each tester's config path so is_unbootable_config can see it.
+                        config_paths_dict = {}
+
+                        for i in range(num_clones):
+                            tester_label = f"linux_{i}"
+                            config_filename = f"current_{i}.config"
+                            config_path = os.path.join(temp_config_dir, config_filename)
+                            with open(config_path, "w") as f:
+                                f.write(tester_configs[tester_label])
+                            config_paths_dict[tester_label] = config_path
+
+                        # 2) Call is_unbootable_config to build + boot test each clone.
+                        unbootable = klocalizer.is_unbootable_config(
+                            config_paths_dict,
+                            arch=arch.name,
+                            start=0,
+                            end=3
+                        )
+
+                        if unbootable:
+                            logger.warning("Bootability lost for (%s:%s)\n" % (unit, line))
+                            bootability_denylist.add((unit, line))
+                            bootable = False
+                        else:
+                            logger.info("Bootability present for (%s:%s)\n" % (unit, line))
+                            bootable = True
+                            # record that this exact patch set is now verified
+                            tested_patch_sets.add(patch_key)
+
+                        # 3) After is_unbootable_config finishes, archive the tester config and logs together.
+                        final_archive_dir = os.path.join(output_dir, "archive_logs")
+                        pathlib.Path(final_archive_dir).mkdir(parents=True, exist_ok=True)
+                        abs_linux_ksrc = os.path.abspath(linux_ksrc)
+
+                        # For each tester, simply use the next log_idx (the same one used for the config)
+                        for i in range(num_clones):
+                            folder_label = f"linux_{i}"
+
+                            # The config text we generated
+                            config_string = tester_configs[folder_label]
+
+                            # We name the archived config with the run ID and the folder_label
+                            archived_config_name = f"tempconfig_run{global_log_idx}_{folder_label}.config"
+                            archived_config_path = os.path.join(final_archive_dir, archived_config_name)
+
+                            with open(archived_config_path, "w") as f:
+                                f.write(config_string)
+
+                            # Similarly for build/boot logs
+                            archived_boot_name = f"boot_run{global_log_idx}_{folder_label}.log"
+                            archived_build_name = f"build_run{global_log_idx}_{folder_label}.log"
+
+                            clone_dir = os.path.join(abs_linux_ksrc, folder_label)
+                            boot_log_path  = os.path.join(clone_dir, "boot.log")
+                            build_log_path = os.path.join(clone_dir, "build.log")
+
+                            if os.path.exists(boot_log_path):
+                                shutil.copy(boot_log_path,
+                                            os.path.join(final_archive_dir, archived_boot_name))
+
+                            if os.path.exists(build_log_path):
+                                shutil.copy(build_log_path,
+                                            os.path.join(final_archive_dir, archived_build_name))
+
+                            # Archive the .config after olddefconfig, if that’s relevant:
+                            final_config_path = os.path.join(clone_dir, ".config")
+                            archived_olddefconfig_name = f"olddefconfig_run{global_log_idx}_{folder_label}.config"
+                            archived_olddefconfig_path = os.path.join(final_archive_dir, archived_olddefconfig_name)
+                            if os.path.exists(final_config_path):
+                                shutil.copy(final_config_path, archived_olddefconfig_path)
+
+                    # Accumulate if SAT and bootable
                     if bootable:
                         accumulated_constraints = constraints_with_line[:]
-                        constraints_with_file = constraints_with_line[:]
                         line_covered = True
                     else:
                         line_covered = False
-
-                    # 3) After is_unbootable_config finishes, archive the tester config and logs together.
-                    final_archive_dir = os.path.join(output_dir, "archive_logs")
-                    pathlib.Path(final_archive_dir).mkdir(parents=True, exist_ok=True)
-                    abs_linux_ksrc = os.path.abspath(linux_ksrc)  # Ensure linux_ksrc is absolute.
-
-                    # For each tester, simply use the next log_idx (the same one used for the config)
-                    for i in range(start_idx, end_idx + 1):
-                        tester_label = f"linux_{i}"
-                        # For simplicity, we use the same index as in the filename (extracted from current_{i}.config)
-                        # Here we assume the order is preserved.
-                        log_idx = i  # or use a separate counter if desired; this is per-run.
-                        archived_config_name = f"tempconfig_run{log_idx}_tester{tester_label}.config"
-                        archived_boot_name   = f"boot_run{log_idx}_tester{tester_label}.log"
-                        archived_build_name  = f"build_run{log_idx}_tester{tester_label}.log"
-
-                        archived_config_path = os.path.join(final_archive_dir, archived_config_name)
-                        archived_boot_path   = os.path.join(final_archive_dir, archived_boot_name)
-                        archived_build_path  = os.path.join(final_archive_dir, archived_build_name)
-
-                        # Archive the tester config.
-                        shutil.copy(config_paths_dict[tester_label], archived_config_path)
-
-                        # Determine clone directory for this tester.
-                        clone_dir = os.path.join(abs_linux_ksrc, tester_label)
-
-                        # Archive the boot log, if it exists.
-                        boot_log_path = os.path.join(clone_dir, "boot.log")
-                        if os.path.exists(boot_log_path):
-                            shutil.copy(boot_log_path, archived_boot_path)
-
-                        # Archive the build log, if it exists.
-                        build_log_path = os.path.join(clone_dir, "build.log")
-                        if os.path.exists(build_log_path):
-                            shutil.copy(build_log_path, archived_build_path)
                 else:
                     line_covered = False
 
@@ -1686,7 +1758,7 @@ def klocalizerCLI():
           approximate_config = None
         new_model_sampler = Klocalizer.Z3ModelSampler(full_constraints,
                                                       approximate_constraints=approximate_config,
-                                                      random_seed=random_seed + ver,
+                                                      random_seed=random.randint(1, 1_000_000),
                                                       logger=logger)
         is_sat, new_model = new_model_sampler.sample_model()
         assert is_sat
