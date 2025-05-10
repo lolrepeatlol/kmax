@@ -1,4 +1,3 @@
-import math
 import time
 from typing import List
 import networkx as nx
@@ -15,13 +14,18 @@ from kmax.klocalizer import Klocalizer
 import multiprocessing as mp
 mp.set_start_method("fork", force=True)
 from collections import defaultdict, Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed, ProcessPoolExecutor
+from concurrent.futures import as_completed, ProcessPoolExecutor
 
 # Logger setup
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("krepair_new")
+logger = logging.getLogger("krepairDC")
 
 DEVNULL = subprocess.DEVNULL
+
+def get_arch_formulas_dir(formulas: str, arch: str) -> str:
+    """Helper to construct the formulas directory path for a given architecture."""
+    assert arch is not None, "Arch name cannot be None"
+    return os.path.join(formulas, f"{arch}_formulas.pkl")
 
 def process_constraint_batch(batch, start_idx):
     """Process a batch of constraints and return string representations"""
@@ -49,20 +53,14 @@ def process_constraint_batch(batch, start_idx):
         except Exception as e:
             print(f"Error processing constraint {start_idx + idx}: {e}")
 
-    return (declarations, assertions)
+    return declarations, assertions
 
-def get_arch_formulas_dir(formulas: str, arch: str) -> str:
-    """Helper to construct the formulas directory path for a given architecture."""
-    assert arch is not None, "Arch name cannot be None"
-    return os.path.join(formulas, f"{arch}_formulas.pkl")
-
-class krepairDivQ:
+class krepairDC:
     DECL_PATTERN = re.compile(r"(CONFIG_[A-Z0-9_]+)")  # compile once for efficiency
 
     def __init__(self, linux_ksrc: str, existing_config_path: str):
         self.linux_ksrc = linux_ksrc  # Path to the Linux kernel source directory
         self.arch_smt2_str = ""
-        self.parsed_arch_constraints = None  # Parsed Z3 constraints for architecture
         self.arch_baseline_solver = None  # Solver for architecture-specific constraints
 
         self.dependency_graph = nx.DiGraph()
@@ -96,12 +94,14 @@ class krepairDivQ:
         self.patch_declarations = {f"(declare-const {token} Bool)" for token in tokens}
         print(f"Cached {len(self.patch_declarations)} declarations.")
 
-    def get_complex_arch_constraints(self, arch_name: str = "x86_64", output_file: str = None):
+    def get_complex_arch_constraints(self, arch_name: str = "x86_64"):
         """
-        this method builds a giant smt2 string and stores it in self.arch_smt2_str.
-        instead of parsing to z3 objects, we keep it as text to avoid pickling errors.
+        Build the SMT‑LIB text for all arch constraints and store it in
+        self.arch_smt2_str, then initialize self.arch_baseline_solver.
         """
+
         try:
+            # 1) Ensure kclause is present / generate if missing
             self.arch = Arch(
                 arch_name,
                 linux_ksrc=self.linux_ksrc,
@@ -110,86 +110,42 @@ class krepairDivQ:
                 kextract_version="next-20210426",
                 loggerLevel=logging.INFO
             )
-
-            # 1) load raw constraints (pickled) from 'kclause_path'
-            kclause_path = os.path.join(self.linux_ksrc, f"{arch_name}_formulas.pkl", 'kclause')
+            kclause_path = os.path.join(self.linux_ksrc,
+                                        f"{arch_name}_formulas.pkl", "kclause")
             if not os.path.exists(kclause_path) or os.path.getsize(kclause_path) == 0:
-                print("Kclause file missing or empty, generating...")
+                print("Kclause file missing or empty, generating…")
                 self.arch.generate_kclause()
-            else:
-                print(f"Found existing kclause file ({os.path.getsize(kclause_path)} bytes)")
-
-            with open(kclause_path, 'rb') as f:
+            with open(kclause_path, "rb") as f:
                 raw_constraints = pickle.load(f)
-            print("loaded raw constraints")
 
+            # 2) Batch‑process into declarations/assertions
             items = list(raw_constraints.items())
             cpu_count = mp.cpu_count()
             chunk_size = max(1, len(items) // (cpu_count * 2))
-            batches = [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
-
-            print(f"processing {len(batches)} batches using {cpu_count} processes...")
-
-            # 2) use mp.Pool to transform raw constraints => declarations/assertions
+            batches = [items[i:i + chunk_size]
+                       for i in range(0, len(items), chunk_size)]
             with mp.Pool(processes=cpu_count) as pool:
-                process_with_index = partial(process_constraint_batch)
-                start_indices = range(0, len(items), chunk_size)
-                batch_results = pool.starmap(process_with_index, zip(batches, start_indices))
+                batch_results = pool.starmap(
+                    partial(process_constraint_batch),
+                    zip(batches, range(0, len(items), chunk_size))
+                )
 
-            all_declarations = set()
-            all_assertions = []
+            all_decls, all_asserts = set(), []
             for decls, asserts in batch_results:
-                all_declarations.update(decls)
-                all_assertions.extend(asserts)
+                all_decls.update(decls)
+                all_asserts.extend(asserts)
 
-            # 3) build the final big text
-            combined_smt2 = "(set-logic QF_UF)\n"
-            for decl in sorted(all_declarations):
-                combined_smt2 += decl + "\n"
-            for assertion in all_assertions:
-                combined_smt2 += assertion + "\n"
+            # 3) Assemble SMT‑LIB text
+            smt = ["(set-logic QF_UF)"]
+            smt.extend(sorted(all_decls))
+            smt.extend(all_asserts)
+            self.arch_smt2_str = "\n".join(smt)
 
-            # note: do not parse here, just store as text
-            self.arch_smt2_str = combined_smt2
-            print(f"[debug] built arch_smt2_str with length: {len(self.arch_smt2_str)} chars")
-
-            try:
-                # First, parse it normally
-                self.parsed_arch_constraints = z3.parse_smt2_string(self.arch_smt2_str)
-                print(f"[DEBUG] Parsed {len(self.parsed_arch_constraints)} arch constraints")
-
-                print("\n[DEBUG] First 10 parsed arch constraints:")
-                for constraint in self.parsed_arch_constraints[:10]:
-                    print(f"  - {constraint} (Type: {type(constraint)})")
-
-                # Now, manually reconstruct logical constraints like the old implementation
-                reconstructed_constraints = []
-                for constraint in self.parsed_arch_constraints:
-                    if isinstance(constraint, z3.BoolRef):
-                        reconstructed_constraints.append(constraint)
-                    else:
-                        # Convert to a Z3 boolean expression if it's in string form
-                        try:
-                            reconstructed_constraints.append(eval(str(constraint)))
-                        except Exception as e:
-                            print(f"[WARNING] Failed to convert constraint: {constraint}, error: {e}")
-
-                self.parsed_arch_constraints = reconstructed_constraints
-                print(f"[DEBUG] Reconstructed {len(self.parsed_arch_constraints)} Z3 constraints")
-            except Exception as e:
-                print(f"[ERROR] Failed to parse arch constraints: {e}")
-                self.parsed_arch_constraints = []
-
+            # 4) Initialize the solver once
             self.init_arch_baseline_solver()
 
-            # optionally write to file
-            if output_file:
-                with open(output_file, "w", encoding='utf-8') as out_f:
-                    out_f.write(combined_smt2)
-                print(f"complex constraints written to {output_file}")
-
         except Exception as e:
-            print(f"error loading complex constraints: {e}")
+            print(f"Error in get_complex_arch_constraints: {e}")
             self.arch_smt2_str = ""
 
     def init_arch_baseline_solver(self):
@@ -217,6 +173,10 @@ class krepairDivQ:
             # 3) add everything
             self.arch_baseline_solver.add(arch_exprs)
             print(f"[debug] arch baseline solver initialized with {len(arch_exprs)} constraints")
+
+            # 4) add Not(CONFIG_BROKEN) constraint
+            CONFIG_BROKEN = z3.Bool("CONFIG_BROKEN", ctx=self.arch_ctx)
+            self.arch_baseline_solver.add(z3.Not(CONFIG_BROKEN))
 
         except Exception as e:
             print(f"[error] initializing arch baseline solver: {e}")
@@ -746,240 +706,265 @@ class krepairDivQ:
         print(f"  Total removed (including 'selectors'): {len(to_remove)}")
         print("  Updated self.patch_constraints, self.unit_constraints, self.unit_configs accordingly.")
 
-    # function to basically take patch_constraints and start iterative solve (add sat until unsat).
-    def check_constraints_until_unsat_parallel(self, num_threads=24):
+    def check_constraints_until_unsat_parallel(self, num_processes=24):
         """
-        Main function that performs parallel checks on patch constraints.
-        Groups patch constraints by their compilation unit using self.unit_constraints,
-        partitions them into a target number of chunks, runs each chunk in parallel,
-        and uses only the filtered constraints returned by the workers (i.e., those
-        actually found satisfiable).
-
-        Assumes:
-          - self.patch_constraints is a list of constraint strings.
-          - self.unit_constraints is a defaultdict(list) mapping unit names -> list of constraint strings.
-          - self.arch_smt2_str and self.patch_declarations are already set.
+        Main function that performs parallel SMT-based satisfiability checks on
+        self.patch_constraints, grouping by compilation unit and merging results.
         """
 
-        # --- Step 1: Gather units and sort by constraint count ---
-        units = list(self.unit_constraints.items())
-        units.sort(key=lambda x: len(x[1]), reverse=True)
+        def get_sorted_units():
+            """
+            Gather and sort compilation units by their number of constraints.
 
-        # --- Step 2: Build Unique Constraints List ---
-        unique_constraints_list = []
-        assigned_constraints = set()
+            :returns: List of (unit_name, constraints_list) sorted descending by list length.
+            """
+            units = list(self.unit_constraints.items())
+            units.sort(key=lambda x: len(x[1]), reverse=True)
+            return units
 
-        for unit_name, constraints in units:
-            for constraint in constraints:
-                if constraint not in assigned_constraints:
-                    unique_constraints_list.append(constraint)
-                    assigned_constraints.add(constraint)
+        def gather_unique_constraints(units):
+            """
+            Build a deduplicated list of all constraints in unit order.
+            """
+            unique = []
+            seen = set()
+            for unit_name, constraints in units:
+                for c in constraints:
+                    if c not in seen:
+                        unique.append(c)
+                        seen.add(c)
+            return unique
 
-        total_unique = len(unique_constraints_list)
-        # Determine number of chunks based on unique constraints.
-        if total_unique < 50:
-            num_chunks = 3
-        elif total_unique < 1000:
-            num_chunks = min(12, num_threads)
-        else:
-            num_chunks = min(num_threads, max(8, total_unique // 150))
+        def determine_num_chunks(total_unique, num_threads):
+            """
+            Decide how many chunks to split into based on total constraints.
+            """
+            if total_unique < 50:
+                return 3
+            elif total_unique < 1000:
+                return min(12, num_threads)
+            else:
+                return min(num_threads, max(8, total_unique // 150))
 
-        print(f"Distributing {total_unique} unique constraints into {num_chunks} chunks.")
+        def distribute_constraints(unique_constraints, num_chunks):
+            """
+            Evenly split the unique constraints list into num_chunks parts.
+            """
+            total = len(unique_constraints)
+            base, extra = divmod(total, num_chunks)
+            chunks, indexes_by_chunk = [], []
+            idx = 0
+            for i in range(num_chunks):
+                size = base + 1 if i < extra else base
+                chunk = unique_constraints[idx:idx+size]
+                chunks.append(chunk)
+                indexes_by_chunk.append(list(range(idx, idx+size)))
+                idx += size
 
-        # --- Step 3: Evenly Distribute Unique Constraints Into Chunks ---
-        base, extra = divmod(total_unique, num_chunks)
-        chunks = []
-        global_indexes_by_chunk = []
-        cumulative_index = 0
+            print(f"Final chunk sizes: {[len(chunk) for chunk in chunks]}")
+            for i, idxs in enumerate(indexes_by_chunk):
+                print(f"Chunk {i} global indexes: {idxs}")
 
-        for i in range(num_chunks):
-            # Give the first 'extra' chunks one extra constraint each.
-            this_chunk_size = base + 1 if i < extra else base
-            chunk_constraints = unique_constraints_list[cumulative_index:cumulative_index + this_chunk_size]
-            chunks.append(chunk_constraints)
-            indexes = list(range(cumulative_index, cumulative_index + this_chunk_size))
-            global_indexes_by_chunk.append(indexes)
-            cumulative_index += this_chunk_size
+            return chunks, indexes_by_chunk
 
-        print(f"Final chunk sizes: {[len(chunk) for chunk in chunks]}")
-        for i in range(num_chunks):
-            print(f"Chunk {i} global indexes: {global_indexes_by_chunk[i]}")
+        def detect_duplicates(chunks):
+            """
+            Sanity check: warn if any normalized constraint appears
+            in more than one chunk.
+            """
+            def normalize(c): return " ".join(c.strip().split())
+            flat = [normalize(c) for chunk in chunks for c in chunk]
+            dups = [c for c, cnt in Counter(flat).items() if cnt > 1]
+            if dups:
+                print(f" WARNING: Detected {len(dups)} duplicate constraints!")
+                for d in dups[:10]:
+                    print(f"  - {d}")
 
-        # Check for duplicates in the initial grouping (optional)
-        def normalize_constraint(c):
-            return " ".join(c.strip().split())
-
-        all_constraints_flat = [normalize_constraint(c) for chunk in chunks for c in chunk]
-        duplicates = [c for c, count in Counter(all_constraints_flat).items() if count > 1]
-        if duplicates:
-            print(f" WARNING: Detected {len(duplicates)} duplicate constraints!")
-            for d in duplicates[:10]:
-                print(f"  - {d}")
-
-        # Build a unified header from patch declarations.
-        all_declarations = "\n".join(sorted(self.patch_declarations))
-        smt_template = f"""(set-logic QF_UF)
-    {all_declarations}
+        def build_smt_scripts(chunks):
+            """
+            Assemble the full SMT-LIB script for each chunk.
+            """
+            header = "\n".join(sorted(self.patch_declarations))
+            template = f"""(set-logic QF_UF)
+    {header}
     %CONSTRAINTS%
     (check-sat)
     """
-        # Build full SMT scripts for each chunk
-        chunk_scripts = []
-        for i, chunk_constraints in enumerate(chunks):
-            chunk_text = "\n".join(chunk_constraints)
-            full_script = smt_template.replace("%CONSTRAINTS%", chunk_text)
-            chunk_scripts.append(full_script)
+            return [
+                template.replace("%CONSTRAINTS%", "\n".join(chunk))
+                for chunk in chunks
+            ]
 
-        # --- Step 4: Parallel processing using ProcessPoolExecutor ---
-        from multiprocessing import Manager
-        manager = Manager()
-        shared_data = manager.Namespace()
-        shared_data.counter = 0
+        def execute_parallel(scripts, chunks, indexes_by_chunk):
+            """
+            Run each SMT script in parallel, tracking progress and collecting results.
+            """
+            manager = mp.Manager()
+            shared = manager.Namespace()
+            shared.counter = 0
 
-        pbar = tqdm(total=total_unique, desc="Processing constraints")
-
-        # We store final, worker-filtered constraints here.
-        filtered_chunks = [[] for _ in range(num_chunks)]  # Will hold only the constraints that passed in each chunk
-
-        with ProcessPoolExecutor(max_workers=num_threads) as executor:
-            future_to_index = {
-                executor.submit(
-                    process_complete_smt_script,
-                    chunk_scripts[i],
-                    i,
-                    global_indexes_by_chunk[i],
-                    chunks[i],
-                    self.patch_constraints,
-                    self.arch_smt2_str,
-                    shared_data,
-                    self.patch_declarations,
-                    self.arch.name
-                ): i for i in range(num_chunks)
-            }
-
-            results_by_index = [None] * num_chunks
+            total_constraints = sum(len(chunk) for chunk in chunks)
+            pbar = tqdm(total=total_constraints, desc="Processing constraints")
+            filtered = [[] for _ in scripts]
+            results = [None] * len(scripts)
             all_temp_unsat = {}
 
-            while any(not fut.done() for fut in future_to_index):
-                pbar.n = shared_data.counter
+            with ProcessPoolExecutor(max_workers=num_processes) as ex:
+                futures = {
+                    ex.submit(
+                        process_complete_smt_script,
+                        scripts[i],
+                        i,
+                        indexes_by_chunk[i],
+                        chunks[i],
+                        self.patch_constraints,
+                        self.arch_smt2_str,
+                        shared,
+                        self.patch_declarations,
+                        self.arch.name
+                    ): i for i in range(len(scripts))
+                }
+
+                while any(not f.done() for f in futures):
+                    pbar.n = shared.counter
+                    pbar.refresh()
+                    time.sleep(0.5)
+                pbar.n = shared.counter
                 pbar.refresh()
-                time.sleep(0.5)
-            pbar.n = shared_data.counter
-            pbar.refresh()
-            pbar.close()
+                pbar.close()
 
-            for fut in as_completed(future_to_index):
-                i = future_to_index[fut]
-                try:
-                    # We now expect a return of:
-                    # (valid_global_indexes, temp_unsat, chunk_id, final_local_constraints)
-                    valid_idx, temp_unsat_list, chunk_id, final_local_constraints = fut.result()
-                    print(f"DEBUG: Result from chunk {i} - Valid global indexes: {valid_idx}")
-                    results_by_index[i] = valid_idx
+                for fut in as_completed(futures):
+                    i = futures[fut]
+                    try:
+                        valid_idx, temp_unsat_list, chunk_id, local_final = fut.result()
+                        print(f"DEBUG: Result from chunk {i} - Valid global indexes: {valid_idx}")
+                        results[i] = valid_idx
+                        filtered[i] = local_final
+                        if temp_unsat_list:
+                            print(f"DEBUG: Temp UNSAT from chunk {i}: {temp_unsat_list}")
+                            all_temp_unsat[chunk_id] = temp_unsat_list
+                    except Exception as e:
+                        print(f"Error in chunk {i}: {e}")
 
-                    # Replace the original chunk with only the filtered constraints
-                    filtered_chunks[i] = final_local_constraints
+            return filtered, results, all_temp_unsat
 
-                    if temp_unsat_list:
-                        print(f"DEBUG: Temp UNSAT from chunk {i}: {temp_unsat_list}")
-                        all_temp_unsat[chunk_id] = temp_unsat_list
+        def collect_valid_indexes(results_by_index):
+            """
+            Flatten and log all valid global indexes from worker results.
+            """
+            all_valid = []
+            for i, res in enumerate(results_by_index):
+                print(f"DEBUG: Chunk {i+1}/{len(results_by_index)} valid global indexes: {res}")
+                if res:
+                    all_valid.extend(res)
+            print(f"DEBUG: Total valid global indexes: {len(all_valid)}")
+            return all_valid
 
-                except Exception as e:
-                    print(f"Error in chunk {i}: {e}")
+        def print_filtered_chunks(filtered_chunks):
+            """
+            Print each worker’s post-filtered constraint list.
+            """
+            print("\n=== Filtered Constraints from Each Worker (No TempUnsat) ===")
+            for i, chunk in enumerate(filtered_chunks):
+                print(f"Filtered Chunk {i}: {len(chunk)} constraints")
+                for c in chunk:
+                    print(f"  - {c.strip()}")
 
-        # --- Step 5: Post-processing - build final list of all valid indexes
-        all_valid_indexes = []
-        for i, chunk_result in enumerate(results_by_index):
-            print(f"DEBUG: Chunk {i+1}/{num_chunks} valid global indexes: {chunk_result}")
-            if chunk_result is not None:
-                all_valid_indexes.extend(chunk_result)
+        def assemble_final_constraints(valid_by_chunk):
+            """
+            Concatenate all remaining constraints in chunk order.
+            """
+            final = []
+            for cid in sorted(valid_by_chunk):
+                final.extend(valid_by_chunk[cid])
+            return final
 
-        print(f"DEBUG: Total valid global indexes: {len(all_valid_indexes)}")
+        def write_final_chunks(valid_by_chunk):
+            """
+            Log final groups and write each to a .smt2 file.
+            """
+            print("\n--- Final Grouped Constraints ---")
+            for cid, cons in sorted(valid_by_chunk.items()):
+                print(f"\nChunk {cid}: {len(cons)} constraints")
+                for c in cons[:5]:
+                    print(f"  - {c.strip()}")
+                fname = f"final_chunk_{cid}.smt2"
+                with open(fname, "w") as f:
+                    f.write("\n".join(cons))
 
-        # Update patch_constraints so it keeps only those matching these valid indexes
-        orig_patch_constraints = self.patch_constraints.copy()
-        self._update_patch_constraints(all_valid_indexes)
+        def update_patch_constraints(all_valid_indexes):
+            """
+            Filter self.patch_constraints to keep only those at valid indexes.
+            """
+            max_valid_index = len(self.patch_constraints) - 1
+            filtered = [i for i in all_valid_indexes if i <= max_valid_index]
+            self.patch_constraints = [self.patch_constraints[i] for i in filtered]
+
+
+        def finalize_results(valid_by_chunk, never_sat, all_temp_unsat):
+            """
+            Update self.patch_constraints with final valid constraints and print a summary.
+
+            Prints:
+              - Total valid constraints
+              - Total temporarily unsatisfiable (temp_unsat) constraints
+              - Total and list of permanently unsatisfiable (never_sat) constraints
+            """
+            # Update patch constraints from organized chunks
+            self.patch_constraints = []
+            for chunk_id in sorted(valid_by_chunk.keys()):
+                self.patch_constraints.extend(valid_by_chunk[chunk_id])
+
+            print("\nFinal Results:")
+            print(f"Total valid constraints: {len(self.patch_constraints)}")
+            print(f"Total TempUnsat constraints: {sum(len(c) for c in all_temp_unsat.values())}")
+            print(f"NeverSat constraints: {len(never_sat)}")
+
+            if never_sat:
+                print("\nNeverSat constraints:")
+                for constraint in never_sat:
+                    print(f"  - {constraint.strip()}")
+
+
+        # Sort and group constraints into chunks
+        units = get_sorted_units()
+        unique_constraints = gather_unique_constraints(units)
+        num_chunks = determine_num_chunks(len(unique_constraints), num_processes)
+        print(f"Distributing {len(unique_constraints)} unique constraints into {num_chunks} chunks.")
+        chunks, global_indexes = distribute_constraints(unique_constraints, num_chunks)
+        detect_duplicates(chunks)  # Sanity check: Duplicates
+        scripts = build_smt_scripts(chunks)  # Build SMT scripts for each chunk
+        filtered_chunks, results_by_index, all_temp_unsat = execute_parallel(scripts, chunks, global_indexes)  # Test constraints in groups
+
+        # Retrieve and print all valid constraints from results
+        all_valid = collect_valid_indexes(results_by_index)
+        update_patch_constraints(all_valid)
         print(f"Successfully processed {len(self.patch_constraints)} constraints")
+        print_filtered_chunks(filtered_chunks)
 
-        # Print the filtered chunks we got back from each worker
-        print("\n=== Filtered Constraints from Each Worker (No TempUnsat) ===")
-        for i, filtered_chunk in enumerate(filtered_chunks):
-            print(f"Filtered Chunk {i}: {len(filtered_chunk)} constraints")
-            for c in filtered_chunk:
-                print(f"  - {c.strip()}")
-
-        print(f"\nFound {len(all_temp_unsat)} chunks with unsat-causing constraints")
-        self._print_temp_unsat(all_temp_unsat)
-
-        # Build valid_by_chunk from the worker-filtered chunks.
-        valid_by_chunk = {}
-        for i, filtered_chunk in enumerate(filtered_chunks):
-            if filtered_chunk:  # non-empty
-                valid_by_chunk[i] = filtered_chunk
-
-        # --- NEW: Run one iteration of merge-as-much-as-possible BEFORE temp_unsat ---
-        valid_by_chunk, completed_sets = self._attempt_merge_chunks(valid_by_chunk, first_phase_only=True)
-
-        # --- Now process temp_unsat after one iteration of merging ---
+        # Merge chunks and process TempUnsat constraints
+        valid_by_chunk = {i: fc for i, fc in enumerate(filtered_chunks) if fc}
+        valid_by_chunk = self._attempt_merge_chunks(valid_by_chunk, first_phase_only=True)
         never_sat = self._process_temp_unsat(all_temp_unsat, valid_by_chunk)
-        self._finalize_results(valid_by_chunk, never_sat, all_temp_unsat)
+        finalize_results(valid_by_chunk, never_sat, all_temp_unsat)
 
-        # --- (Optional) Run final merge phase for further consolidation ---
-        valid_by_chunk, completed_sets = self._attempt_merge_chunks(valid_by_chunk)
-        self.patch_constraints = []
-        for chunk_id in sorted(valid_by_chunk.keys()):
-            self.patch_constraints.extend(valid_by_chunk[chunk_id])
-
+        # Final merge pass to ensure all constraints are grouped tightly
+        valid_by_chunk = self._attempt_merge_chunks(valid_by_chunk)
+        self.patch_constraints = assemble_final_constraints(valid_by_chunk)
         print(f"Final constraints count after merging: {len(self.patch_constraints)}")
-        print(f"Completed sets (never merged): {len(completed_sets)}")
+        write_final_chunks(valid_by_chunk)
 
-        print("\n--- Final Grouped Constraints ---")
-        final_constraints = self.patch_constraints
-        for chunk_id, constraints in sorted(valid_by_chunk.items()):
-            print(f"\nChunk {chunk_id}: {len(constraints)} constraints")
-            for constraint in constraints[:5]:
-                print(f"  - {constraint.strip()}")
-            chunk_filename = f"final_chunk_{chunk_id}.smt2"
-            with open(chunk_filename, "w") as chunk_file:
-                chunk_file.write("\n".join(constraints))
-
-        print("\n--- Completed Sets (Unmerged) ---")
-        for chunk_id in sorted(completed_sets):
-            print(f"Chunk {chunk_id} was never merged.")
-
+        # Store the final merged groups for future use
         self.merged_groups = valid_by_chunk
-
         return {
             "added_constraints": len(self.patch_constraints),
             "temp_unsat": all_temp_unsat,
             "never_sat": never_sat
         }
 
-    def _update_patch_constraints(self, all_valid_indexes):
-        max_valid_index = len(self.patch_constraints) - 1
-        filtered = [i for i in all_valid_indexes if i <= max_valid_index]
-        self.patch_constraints = [self.patch_constraints[i] for i in filtered]
-
-    def _print_temp_unsat(self, all_temp_unsat):
-        """Print temporary UNSAT constraints"""
-        print("\nTempUnsat constraints by chunk:")
-        for chunk_id, constraints in sorted(all_temp_unsat.items()):
-            print(f"\nChunk {chunk_id}:")
-            for constraint in constraints:
-                print(f"  - {constraint.strip()}")
-
-    def _organize_valid_constraints(self, all_valid_indexes, global_indexes_by_chunk, orig_constraints):
-        valid_by_chunk = {}
-        for i, global_list in enumerate(global_indexes_by_chunk):
-            # Only include global indexes that are in all_valid_indexes.
-            valid_indexes_in_chunk = [g for g in global_list if g in all_valid_indexes]
-            if valid_indexes_in_chunk:
-                valid_by_chunk[i] = [orig_constraints[g] for g in valid_indexes_in_chunk]
-        return valid_by_chunk
-
     def _process_temp_unsat(self, all_temp_unsat, valid_by_chunk):
         """
-        Refactored processing for temp_unsat constraints.
+        Processing for temp_unsat constraints.
         For each group in valid_by_chunk we create one solver instance.
         For each candidate temp_unsat constraint we push a new context, add it (with its full
         declarations) to the group’s solver, and test for satisfiability.
@@ -988,7 +973,6 @@ class krepairDivQ:
         allowed attempts (3 if there are 3+ groups, or equal to the number of groups if fewer),
         it is marked as never_sat.
         """
-
         never_sat = set()
 
         # Combine all temp_unsat constraints into a unique list.
@@ -1070,38 +1054,192 @@ class krepairDivQ:
         print(f"\nDEBUG: Final never_sat constraints count: {len(never_sat)}")
         return never_sat
 
-    def _finalize_results(self, valid_by_chunk, never_sat, all_temp_unsat):
-        """Finalize and print results"""
-        # Update patch constraints from organized chunks
-        self.patch_constraints = []
-        for chunk_id in sorted(valid_by_chunk.keys()):
-            self.patch_constraints.extend(valid_by_chunk[chunk_id])
+    def _get_unsat_core(self, constraints):
+        """
+        Attempts to extract an unsatisfiable core from a list of SMT constraints.
 
-        print("\nFinal Results:")
-        print(f"Total valid constraints: {len(self.patch_constraints)}")
-        print(f"Total TempUnsat constraints: {sum(len(c) for c in all_temp_unsat.values())}")
-        print(f"NeverSat constraints: {len(never_sat)}")
+        For each constraint, a fresh Boolean assumption (e.g. ``a0``, ``a1``, ...) is declared,
+        and the constraint is rewritten as an implication: ``(=> ai <constraint>)``. A solver
+        is created with unsat core tracking enabled, and the function checks satisfiability
+        under these assumptions.
 
-        if never_sat:
-            print("\nNeverSat constraints:")
-            for constraint in never_sat:
-                print(f"  - {constraint.strip()}")
+        If the constraints are unsatisfiable, the solver returns an unsat core containing
+        some of the assumptions. This function then maps each assumption in the core
+        back to the list of ``CONFIG_*`` options that appeared in the corresponding constraint.
+        """
+        # TODO: implement much simpler & more robust unsat core extraction
+
+        def strip_outer_assert(constraint_text):
+            """
+            Removes an outer (assert …) wrapper if present.
+            This simple function assumes a well-formed single assertion.
+            """
+            s = constraint_text.strip()
+            if s.startswith("(assert"):
+                s = s[len("(assert"):].strip()
+                if s and s[-1] == ")":
+                    s = s[:-1].strip()
+            return s
+
+        # 1. Extract all CONFIG_* symbols from the constraints.
+        config_ids = set()
+        config_pattern = r"(CONFIG_[A-Z0-9_]+)"
+        for ct in constraints:
+            config_ids.update(re.findall(config_pattern, ct))
+
+        # 2. Gather user patch declarations (if available) and determine which CONFIG_* are already declared.
+        declared_ids = set()
+        patch_decl_text = ""
+        if hasattr(self, 'patch_declarations') and self.patch_declarations:
+            patch_decl_text = "\n".join(self.patch_declarations)
+            declared_ids = set(re.findall(r"\(declare-const\s+([A-Z0-9_]+)\s+Bool\)", patch_decl_text))
+
+        # 3. Auto-declare any missing CONFIG_* symbols.
+        auto_decls = []
+        for cfg in sorted(config_ids):
+            if cfg not in declared_ids:
+                auto_decls.append(f"(declare-const {cfg} Bool)")
+        auto_decl_text = "\n".join(auto_decls)
+
+        # 4. Build the SMT2 script.
+        script_lines = []
+        # Set logic and enable unsat core production.
+        script_lines.append("(set-logic QF_UF)")
+        script_lines.append("(set-option :produce-unsat-cores true)")
+        if patch_decl_text:
+            script_lines.append(patch_decl_text)
+        if auto_decl_text:
+            script_lines.append(auto_decl_text)
+
+        # 5. For each constraint, declare a fresh Boolean assumption.
+        num_constraints = len(constraints)
+        for idx in range(num_constraints):
+            script_lines.append(f"(declare-const a{idx} Bool)")
+
+        # 6. Build a mapping from assumption name to config options in that constraint.
+        constraint_config_map = {}
+        for idx, ct in enumerate(constraints):
+            inner = strip_outer_assert(ct)
+            # Extract CONFIG_* options from the inner expression.
+            config_options = re.findall(config_pattern, inner)
+            constraint_config_map[f"a{idx}"] = config_options
+            # Assert the implication using the assumption a{idx}.
+            script_lines.append(f"(assert (=> a{idx} {inner}))")
+
+        final_script = "\n".join(script_lines)
+        # print("Final SMT2 script:\n", final_script)
+
+        # 7. Create a fresh solver with unsat core tracking enabled.
+        solver = z3.Solver(ctx=self.arch_baseline_solver.ctx)
+        solver.set(unsat_core=True)
+        try:
+            solver.append(*self.arch_baseline_solver.assertions())
+        except Exception as e:
+            print(f"[ERROR] Failed to re-add baseline assertions: {e}")
+            return None
+
+        try:
+            parsed = z3.parse_smt2_string(final_script, ctx=self.arch_baseline_solver.ctx)
+            solver.add(parsed)
+        except Exception as e:
+            print(f"[ERROR] parse_smt2_string failed in get_unsat_core: {e}")
+            return None
+
+        # 8. Create a list of assumption literals using z3.Bool with the solver's context.
+        assumption_literals = [z3.Bool(f"a{idx}", ctx=solver.ctx) for idx in range(num_constraints)]
+        # 9. Check the solver with these assumptions (passed as positional arguments).
+        res = solver.check(*assumption_literals)
+        if res == z3.sat:
+            print("[INFO] Unexpected: constraints are satisfiable when attempting to get unsat core.")
+            return None
+        elif res == z3.unknown:
+            print("[WARNING] Solver returned unknown for unsat core check.")
+            return None
+        else:
+            core = solver.unsat_core()
+            # Build a mapping from unsat assumption names to config options.
+            unsat_mapping = {}
+            for item in core:
+                item_name = str(item)
+                unsat_mapping[item_name] = constraint_config_map.get(item_name, [])
+            return unsat_mapping
+
+    def _test_chunk_satisfiability(self, constraints):
+        """
+        Checks whether a given chunk of SMT constraints is satisfiable.
+
+        This function creates a new Z3 solver using the same context as the
+        architecture baseline solver. It re-adds the architecture-level constraints,
+        patch declarations (if any), and then adds the given constraint chunk.
+        It returns True if the resulting constraint set is satisfiable.
+        """
+        # Ensure the baseline solver is initialized.
+        if self.arch_baseline_solver is None:
+            print("[WARNING] arch_baseline_solver is None, reinitializing...")
+            self.init_arch_baseline_solver()
+            if self.arch_baseline_solver is None:
+                print("[ERROR] arch_baseline_solver still None; cannot test satisfiability.")
+                return False
+
+        # Create a new solver in the same context as the baseline solver.
+        cloned_solver = z3.Solver(ctx=self.arch_baseline_solver.ctx)
+
+        # Explicitly re-add the full architecture constraints from arch_smt2_str.
+        try:
+            cloned_solver.append(*self.arch_baseline_solver.assertions())
+        except Exception as e:
+            print(f"[ERROR] Failed to re-add baseline assertions in test_chunk_satisfiability: {e}")
+            return False
+
+        # Add the patch declarations if available.
+        patch_decl_text = "\n".join(sorted(self.patch_declarations))
+        if patch_decl_text.strip():
+            try:
+                parsed_decls = z3.parse_smt2_string(
+                    f"(set-logic QF_UF)\n{patch_decl_text}",
+                    ctx=self.arch_baseline_solver.ctx
+                )
+                cloned_solver.add(parsed_decls)
+            except Exception as e:
+                print(f"[WARNING] Failed to add patch declarations: {e}")
+
+        # Build the script for the given constraints.
+        script = "\n".join([
+            "(set-logic QF_UF)",
+            patch_decl_text,
+            *constraints
+        ])
+        try:
+            parsed = z3.parse_smt2_string(script, ctx=self.arch_baseline_solver.ctx)
+        except Exception as e:
+            print(f"[ERROR] Failed to parse chunk constraints: {e}")
+            return False
+
+        cloned_solver.add(parsed)
+
+        return (cloned_solver.check() == z3.sat)
 
     def _attempt_merge_chunks(self, valid_by_chunk, first_phase_only=False):
         """
-        Perform merging of groups of patch constraints in two phases:
-          1. Round-Robin Merge (less greedy) – if first_phase_only is True, repeatedly
-             attempts to merge adjacent pairs (e.g. Chunk 1 with 2, Chunk 3 with 4, etc.)
-             until no further merges are possible.
-          2. Merge-As-Much-As-Possible – general merge phase.
+        Attempts to merge satisfiable chunks of patch constraints.
 
-        When first_phase_only is True, Phase-1 runs until no adjacent merges occur,
-        then Phase-2 runs for one iteration (if any merge occurs) to allow for temp_unsat processing.
-        When first_phase_only is False, Phase-1 is skipped entirely.
+        The merge process can run in one or two phases:
+
+        1. Round-Robin Merge (Phase 1)
+           Adjacent chunks (1 and 2, 3 and 4, etc.) are repeatedly merged until no more
+           neighbouring pairs are satisfiable. This phase is executed only when
+           ``first_phase_only`` is ``True``.
+
+        2. Merge-As-Much-As-Possible (Phase 2)
+           Remaining chunks are considered in size order and greedily merged whenever
+           the combined constraints remain satisfiable. The loop stops when an
+           iteration produces no successful merges.
+           If first_phase_only is True, Phase 2 is limited to a single
+           iteration (to allow later handling of temporarily-unsat constraints).
         """
-        from collections import defaultdict
+        # TODO: split function
+
         tried_chunks = defaultdict(set)
-        completed_sets = set()  # (unused in this snippet, but kept for future use)
 
         # PHASE 1: Repeated Round-Robin Merge (only if first_phase_only is True)
         if first_phase_only:
@@ -1151,11 +1289,11 @@ class krepairDivQ:
             used_this_pass = set()
 
             for i, c1 in enumerate(chunk_ids):
-                if c1 in completed_sets or c1 in used_this_pass:
+                if c1 in used_this_pass:
                     continue
                 for j in range(i + 1, len(chunk_ids)):
                     c2 = chunk_ids[j]
-                    if c2 in completed_sets or c2 in used_this_pass or c2 in tried_chunks[c1]:
+                    if c2 in used_this_pass or c2 in tried_chunks[c1]:
                         continue
                     print(f"\nPass: Trying to merge Chunk {c1} ({len(valid_by_chunk[c1])} constraints) "
                           f"with Chunk {c2} ({len(valid_by_chunk[c2])} constraints)...")
@@ -1192,169 +1330,25 @@ class krepairDivQ:
         print("\nFinal Merging Completed.")
         final_chunks = sorted(valid_by_chunk.keys(), key=lambda cid: len(valid_by_chunk[cid]))
         print(f"Remaining Chunks: {final_chunks}")
-        print(f"Completed Sets: {len(completed_sets)}")
-        return valid_by_chunk, completed_sets
-
-    def strip_outer_assert(self, constraint_text):
-        """
-        Removes an outer (assert …) wrapper if present.
-        This simple function assumes a well-formed single assertion.
-        """
-        s = constraint_text.strip()
-        if s.startswith("(assert"):
-            s = s[len("(assert"):].strip()
-            if s and s[-1] == ")":
-                s = s[:-1].strip()
-        return s
-
-    def _get_unsat_core(self, constraints):
-        """
-        Retrieve the unsat core for the given list of constraints by building a single SMT2
-        script that:
-          - Sets the logic and enables unsat core production.
-          - Adds user-provided patch declarations (if any) and auto-declares any missing CONFIG_* symbols.
-          - For each constraint, declares a fresh Boolean assumption and asserts the implication: (=> a_i <constraint>).
-
-        In addition, it builds a mapping from each assumption literal (e.g. "a5") to the list of CONFIG options
-        that appear in the corresponding constraint.
-
-        After calling solver.check with these assumptions, it returns a dictionary mapping assumption names (from
-        the unsat core) to the CONFIG option names extracted from the corresponding constraint.
-        """
-        # 1. Extract all CONFIG_* symbols from the constraints.
-        config_ids = set()
-        config_pattern = r"(CONFIG_[A-Z0-9_]+)"
-        for ct in constraints:
-            config_ids.update(re.findall(config_pattern, ct))
-
-        # 2. Gather user patch declarations (if available) and determine which CONFIG_* are already declared.
-        declared_ids = set()
-        patch_decl_text = ""
-        if hasattr(self, 'patch_declarations') and self.patch_declarations:
-            patch_decl_text = "\n".join(self.patch_declarations)
-            declared_ids = set(re.findall(r"\(declare-const\s+([A-Z0-9_]+)\s+Bool\)", patch_decl_text))
-
-        # 3. Auto-declare any missing CONFIG_* symbols.
-        auto_decls = []
-        for cfg in sorted(config_ids):
-            if cfg not in declared_ids:
-                auto_decls.append(f"(declare-const {cfg} Bool)")
-        auto_decl_text = "\n".join(auto_decls)
-
-        # 4. Build the SMT2 script.
-        script_lines = []
-        # Set logic and enable unsat core production.
-        script_lines.append("(set-logic QF_UF)")
-        script_lines.append("(set-option :produce-unsat-cores true)")
-        if patch_decl_text:
-            script_lines.append(patch_decl_text)
-        if auto_decl_text:
-            script_lines.append(auto_decl_text)
-
-        # 5. For each constraint, declare a fresh Boolean assumption.
-        num_constraints = len(constraints)
-        for idx in range(num_constraints):
-            script_lines.append(f"(declare-const a{idx} Bool)")
-
-        # 6. Build a mapping from assumption name to config options in that constraint.
-        constraint_config_map = {}
-        for idx, ct in enumerate(constraints):
-            inner = self.strip_outer_assert(ct)
-            # Extract CONFIG_* options from the inner expression.
-            config_options = re.findall(config_pattern, inner)
-            constraint_config_map[f"a{idx}"] = config_options
-            # Assert the implication using the assumption a{idx}.
-            script_lines.append(f"(assert (=> a{idx} {inner}))")
-
-        final_script = "\n".join(script_lines)
-        # Uncomment the next line for debugging the SMT2 script.
-        # print("Final SMT2 script:\n", final_script)
-
-        # 7. Create a fresh solver with unsat core tracking enabled.
-        solver = z3.Solver(ctx=self.arch_baseline_solver.ctx)
-        solver.set(unsat_core=True)
-        try:
-            solver.append(*self.arch_baseline_solver.assertions())
-        except Exception as e:
-            print(f"[ERROR] Failed to re-add baseline assertions: {e}")
-            return None
-
-        try:
-            parsed = z3.parse_smt2_string(final_script, ctx=self.arch_baseline_solver.ctx)
-            solver.add(parsed)
-        except Exception as e:
-            print(f"[ERROR] parse_smt2_string failed in _get_unsat_core: {e}")
-            # Uncomment for debugging:
-            # print(final_script)
-            return None
-
-        # 8. Create a list of assumption literals using z3.Bool with the solver's context.
-        assumption_literals = [z3.Bool(f"a{idx}", ctx=solver.ctx) for idx in range(num_constraints)]
-        # 9. Check the solver with these assumptions (passed as positional arguments).
-        res = solver.check(*assumption_literals)
-        if res == z3.sat:
-            print("[INFO] Unexpected: constraints are satisfiable when attempting to get unsat core.")
-            return None
-        elif res == z3.unknown:
-            print("[WARNING] Solver returned unknown for unsat core check.")
-            return None
-        else:
-            core = solver.unsat_core()
-            # Build a mapping from unsat assumption names to config options.
-            unsat_mapping = {}
-            for item in core:
-                item_name = str(item)
-                unsat_mapping[item_name] = constraint_config_map.get(item_name, [])
-            return unsat_mapping
-
-    def _test_chunk_satisfiability(self, constraints):
-        # Ensure the baseline solver is initialized.
-        if self.arch_baseline_solver is None:
-            print("[WARNING] arch_baseline_solver is None, reinitializing...")
-            self.init_arch_baseline_solver()
-            if self.arch_baseline_solver is None:
-                print("[ERROR] arch_baseline_solver still None; cannot test satisfiability.")
-                return False
-
-        # Create a new solver in the same context as the baseline solver.
-        cloned_solver = z3.Solver(ctx=self.arch_baseline_solver.ctx)
-
-        # Explicitly re-add the full architecture constraints from arch_smt2_str.
-        try:
-            cloned_solver.append(*self.arch_baseline_solver.assertions())
-        except Exception as e:
-            print(f"[ERROR] Failed to re-add baseline assertions in _test_chunk_satisfiability: {e}")
-            return False
-
-        # Add the patch declarations if available.
-        patch_decl_text = "\n".join(sorted(self.patch_declarations))
-        if patch_decl_text.strip():
-            try:
-                parsed_decls = z3.parse_smt2_string(
-                    f"(set-logic QF_UF)\n{patch_decl_text}",
-                    ctx=self.arch_baseline_solver.ctx
-                )
-                cloned_solver.add(parsed_decls)
-            except Exception as e:
-                print(f"[WARNING] Failed to add patch declarations: {e}")
-
-        # Build the script for the given constraints.
-        script = "\n".join([
-            "(set-logic QF_UF)",
-            patch_decl_text,
-            *constraints
-        ])
-        try:
-            parsed = z3.parse_smt2_string(script, ctx=self.arch_baseline_solver.ctx)
-        except Exception as e:
-            print(f"[ERROR] Failed to parse chunk constraints: {e}")
-            return False
-
-        cloned_solver.add(parsed)
-
-        return (cloned_solver.check() == z3.sat)
+        return valid_by_chunk
 
     def generate_repaired_configs(self, output_dir: str):
+        """
+        Generates repaired Linux kernel configuration files for each constraint group
+        and saves them to the specified output directory.
+
+        For each constraint group, this function builds a combined SMT formula using:
+        - architecture-specific constraints,
+        - patch-specific constraints, and
+        - approximate constraints derived from an existing ``.config`` file.
+
+        It checks satisfiability of the combined formula using Z3. If satisfiable, a
+        kernel configuration is generated from the model and saved to the output
+        directory. Debug files, including the full SMT formula and model statistics,
+        are also written for each group.
+        """
+        # TODO: break function into smaller parts & simplify
+
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
 
@@ -1363,7 +1357,7 @@ class krepairDivQ:
         print("\n[INFO] Generating repaired configuration files...\n")
 
         # Parse architecture constraints if we haven't already
-        if not self.parsed_arch_constraints:
+        if not self.arch_baseline_solver.assertions():
             print("[ERROR] Parsed arch constraints are empty! Check parsing step.")
 
         # Get approximate constraints from existing config
@@ -1460,6 +1454,10 @@ class krepairDivQ:
                 for c in parsed_patch_constraints:
                     smt_script_full += "(assert " + c.sexpr() + ")\n"
 
+                # Write full constraints to a file for debugging
+                with open(f"full_constraints_group_{group_id}.smt2", "w") as f:
+                    f.write(smt_script_full)
+
                 # Check basic satisfiability without approximate constraints
                 basic_solver = z3.Solver(ctx=self.arch_ctx)
                 basic_solver.add(full_constraints)
@@ -1545,9 +1543,13 @@ def process_complete_smt_script(
         arch_name
 ):
     """
-    Optimized version that uses a single solver per worker (per chunk) and
-    push/pop to test each constraint incrementally. If a constraint causes
-    unsat, we pop it and record it in temp_unsat.
+    Filters a single chunk of patch constraints, keeping only those that remain
+    satisfiable when added to the architecture baseline.
+
+    For the given ``chunk_idx`` the function builds a fresh Z3 solver, loads
+    architecture-wide constraints and patch-level declarations, then pushes each
+    constraint one-by-one.  If adding a constraint preserves satisfiability it is
+    kept; otherwise it is popped and recorded in temp_unsat.
     """
     chunk_id = chunk_idx + 1
     print(f"\n=== Processing chunk {chunk_id} ===")
@@ -1570,14 +1572,16 @@ def process_complete_smt_script(
             print("Debug: arch_smt2_str is empty, no arch constraints added.")
 
         # 1.2) pull in *all* per‑arch constraints via the helper
+        # TODO: look into using existing baseline solver instead of pulling arch constraints again
         arch = Arch(arch_name)
         extra_arch_exprs = [
             expr.translate(ctx) for expr in arch.get_arch_specific_constraints()
         ]
         solver.add(extra_arch_exprs)
+        solver.add(z3.Not(z3.Bool("CONFIG_BROKEN", ctx=ctx)))
         print(f"Debug: Added {len(extra_arch_exprs)} arch‑specific assertions from helper.")
 
-        # 1.3) parse & add your patch‑level declarations
+        # 1.3) parse & add patch‑level declarations
         if patch_declarations:
             decl_script = "\n".join(["(set-logic QF_UF)"] + sorted(patch_declarations))
             parsed_decls = z3.parse_smt2_string(decl_script, ctx=ctx)
@@ -1638,18 +1642,19 @@ def process_complete_smt_script(
 
 
 def main():
+    # Tester/prototyping function
 
-    linux_ksrc = "/home/alexei/LinuxKernels/krepair_alg/pre-study-fixes/linux_300commitset_copy"
+    linux_ksrc = "/home/alexei/LinuxKernels/krepair_alg/pre-study-fixes/linux_copy"
     existing_config_file = f"{linux_ksrc}/.config"
     unbootable_options_file = "/home/alexei/LinuxKernels/krepair_alg/linux_set50copy/unbootable_options.txt"
-    output_dir = f"{linux_ksrc}/repaired_configs"
+    output_dir = f"{linux_ksrc}"
 
-    krepair = krepairDivQ(linux_ksrc, existing_config_path=existing_config_file)
+    krepair = krepairDC(linux_ksrc, existing_config_path=existing_config_file)
 
     # Get arch constraints
-    krepair.get_complex_arch_constraints("x86_64", f"{linux_ksrc}/arch_constraints_x86_64.txt")
+    krepair.get_complex_arch_constraints("x86_64")
 
-    # Start recording amount of time for mutex algorithm (alg 1)
+    # Start recording amount of time for krepairDC mutex algorithm
     start_time = time.time()
 
     # Read kextract output
