@@ -602,33 +602,33 @@ class krepairDC:
         print(f"  Total patch configs: {len(self.patch_constraints)}\n")
 
         # Create a separate unit for constraints containing "not"
-        not_constraints = []
-        new_unit_constraints = defaultdict(list)
+        #not_constraints = []
+        #new_unit_constraints = defaultdict(list)
 
-        for unit, constraints in self.unit_constraints.items():
-            for constraint in constraints:
-                if "not" in constraint:
-                    not_constraints.append(constraint)  # Store separately
-                else:
-                    new_unit_constraints[unit].append(constraint)  # Keep in original unit
+        #for unit, constraints in self.unit_constraints.items():
+        #    for constraint in constraints:
+        #        if "not" in constraint:
+        #            not_constraints.append(constraint)  # Store separately
+        #        else:
+        #            new_unit_constraints[unit].append(constraint)  # Keep in original unit
 
         # Assign the modified unit constraints back
-        self.unit_constraints = new_unit_constraints
+        #self.unit_constraints = new_unit_constraints
 
         # Add the new unit for "not" constraints if any exist
-        if not_constraints:
-            self.unit_constraints["not_constraints"] = not_constraints
+        #if not_constraints:
+        #    self.unit_constraints["not_constraints"] = not_constraints
 
         # Also reorder self.patch_constraints
-        not_patch_constraints = [c for c in self.patch_constraints if "not" in c]
-        self.patch_constraints = [c for c in self.patch_constraints if "not" not in c] + not_patch_constraints
+        #not_patch_constraints = [c for c in self.patch_constraints if "not" in c]
+        #self.patch_constraints = [c for c in self.patch_constraints if "not" not in c] + not_patch_constraints
 
         # Debugging Output (Optional)
-        print("\n[Debug] Reordered Unit Constraints:")
-        for unit, constraints in self.unit_constraints.items():
-            print(f"Unit: {unit}")
-            for c in constraints:
-                print(f"  {c}")
+        #print("\n[Debug] Reordered Unit Constraints:")
+        #for unit, constraints in self.unit_constraints.items():
+        #    print(f"Unit: {unit}")
+         #   for c in constraints:
+         #       print(f"  {c}")
 
         print("\n[Debug] Reordered Patch Constraints:")
         for c in self.patch_constraints:
@@ -926,8 +926,7 @@ class krepairDC:
                     print(f"  - {constraint.strip()}")
 
 
-        # Sort and group constraints into chunks
-        units = get_sorted_units()
+        units = list(self.unit_constraints.items())
         unique_constraints = gather_unique_constraints(units)
         num_chunks = determine_num_chunks(len(unique_constraints), num_processes)
         print(f"Distributing {len(unique_constraints)} unique constraints into {num_chunks} chunks.")
@@ -936,25 +935,28 @@ class krepairDC:
         scripts = build_smt_scripts(chunks)  # Build SMT scripts for each chunk
         filtered_chunks, results_by_index, all_temp_unsat = execute_parallel(scripts, chunks, global_indexes)  # Test constraints in groups
 
-        # Retrieve and print all valid constraints from results
+        # Collect and update the always‑sat constraints
         all_valid = collect_valid_indexes(results_by_index)
         update_patch_constraints(all_valid)
         print(f"Successfully processed {len(self.patch_constraints)} constraints")
         print_filtered_chunks(filtered_chunks)
 
-        # Merge chunks and process TempUnsat constraints
+        # Prepare the valid_by_chunk mapping
         valid_by_chunk = {i: fc for i, fc in enumerate(filtered_chunks) if fc}
-        valid_by_chunk = self._attempt_merge_chunks(valid_by_chunk, first_phase_only=True)
+
+        # Process ALL temp_unsat before merging ever happens
         never_sat = self._process_temp_unsat(all_temp_unsat, valid_by_chunk)
         finalize_results(valid_by_chunk, never_sat, all_temp_unsat)
 
-        # Final merge pass to ensure all constraints are grouped tightly
+        # Single‐shot merge: run both Phase 1 & Phase 2
         valid_by_chunk = self._attempt_merge_chunks(valid_by_chunk)
+
+        # Assemble and write out final constraints
         self.patch_constraints = assemble_final_constraints(valid_by_chunk)
         print(f"Final constraints count after merging: {len(self.patch_constraints)}")
         write_final_chunks(valid_by_chunk)
 
-        # Store the final merged groups for future use
+        # Save & return
         self.merged_groups = valid_by_chunk
         return {
             "added_constraints": len(self.patch_constraints),
@@ -962,34 +964,23 @@ class krepairDC:
             "never_sat": never_sat
         }
 
+
     def _process_temp_unsat(self, all_temp_unsat, valid_by_chunk):
         """
         Processing for temp_unsat constraints.
-        For each group in valid_by_chunk we create one solver instance.
-        For each candidate temp_unsat constraint we push a new context, add it (with its full
-        declarations) to the group’s solver, and test for satisfiability.
-        If it is sat, we pop and then permanently add it (updating the group's declared tokens).
-        If unsat, we pop, increment a strike, and once the candidate has reached the maximum
-        allowed attempts (3 if there are 3+ groups, or equal to the number of groups if fewer),
-        it is marked as never_sat.
+        For each group in valid_by_chunk, we test each candidate constraint once:
+        - If it is satisfiable, permanently add it to the group.
+        - Otherwise, mark it as never_sat immediately.
         """
         never_sat = set()
 
-        # Combine all temp_unsat constraints into a unique list.
+        # Combine all temp_unsat constraints into a unique list
         combined_temp_unsat = set()
         for constraints in all_temp_unsat.values():
             combined_temp_unsat.update(constraints)
         combined_temp_unsat = list(combined_temp_unsat)
 
-        # Initialize strike counts.
-        strike_counts = {c: 0 for c in combined_temp_unsat}
-        group_count = len(valid_by_chunk)
-        max_attempts = 3 if group_count >= 3 else group_count
-
-        # Helper: Given a candidate constraint and the set of tokens already declared for the group,
-        # build an SMT2 snippet that declares the union of all tokens (group tokens and candidate tokens)
-        # and then asserts the candidate constraint.
-        # Returns the parsed expressions and the candidate's tokens (to update the group's declared set later).
+        # Helper to parse a candidate constraint
         def parse_candidate_constraint(constraint, group_declared_tokens):
             candidate_tokens = set(re.findall(r"(CONFIG_[A-Z0-9_]+)", constraint))
             all_tokens = group_declared_tokens.union(candidate_tokens)
@@ -998,60 +989,50 @@ class krepairDC:
             exprs = z3.parse_smt2_string(full_script, ctx=self.arch_baseline_solver.ctx)
             return exprs, candidate_tokens
 
-        # Create one solver per group and track declared tokens for each group.
+        # Create one solver per group and track declared tokens
         solvers = {}
         solver_declared_tokens = {}
         for group_id, constraints in valid_by_chunk.items():
             solver = z3.Solver(ctx=self.arch_baseline_solver.ctx)
-            # Add baseline assertions.
             solver.append(*self.arch_baseline_solver.assertions())
             declared = set()
             for cons in constraints:
-                # For each valid constraint, build a full SMT2 snippet that includes all needed declarations.
                 exprs, tokens = parse_candidate_constraint(cons, declared)
                 solver.add(*exprs)
                 declared.update(tokens)
             solvers[group_id] = solver
             solver_declared_tokens[group_id] = declared
 
-        # Process groups in order of increasing size.
+        # Process groups in order of increasing size
         sorted_group_ids = sorted(valid_by_chunk.keys(), key=lambda cid: len(valid_by_chunk[cid]))
         for group_id in sorted_group_ids:
             solver = solvers[group_id]
-            print(f"Processing temp_unsat constraints for group {group_id} (current size: {len(valid_by_chunk[group_id])})")
-            # Iterate over a copy of the remaining candidate constraints.
-            for constraint in list(strike_counts.keys()):
+            print(f"Processing temp_unsat for group {group_id} (size: {len(valid_by_chunk[group_id])})")
+
+            # Test each candidate once
+            for constraint in combined_temp_unsat[:]:  # iterate over copy
                 solver.push()
-                # Build the SMT2 snippet for the candidate using the union of declared tokens and candidate tokens.
                 exprs, candidate_tokens = parse_candidate_constraint(constraint, solver_declared_tokens[group_id])
                 solver.add(*exprs)
-                result = solver.check()
-                if result == z3.sat:
-                    solver.pop()  # Remove the temporary addition.
-                    # Permanently add the candidate constraint.
+                if solver.check() == z3.sat:
+                    solver.pop()
+                    # Permanently add the constraint
                     exprs, candidate_tokens = parse_candidate_constraint(constraint, solver_declared_tokens[group_id])
                     solver.add(*exprs)
-                    # Update the group's declared tokens.
                     solver_declared_tokens[group_id].update(candidate_tokens)
                     valid_by_chunk[group_id].append(constraint)
-                    # Explicitly remove from tempunsat
                     combined_temp_unsat.remove(constraint)
-                    print(f"  ✓ Added constraint to group {group_id}: {constraint.strip()}")
-                    del strike_counts[constraint]
+                    print(f"  ✓ Added constraint: {constraint.strip()}")
                 else:
-                    solver.pop()  # Revert the temporary addition.
-                    strike_counts[constraint] += 1
-                    print(f"  × Constraint failed for group {group_id}: {constraint.strip()} (strike {strike_counts[constraint]})")
-                    if strike_counts[constraint] >= max_attempts:
-                        never_sat.add(constraint)
-                        print(f"  → Marked as never_sat: {constraint.strip()}")
-                        del strike_counts[constraint]
+                    solver.pop()
+                    never_sat.add(constraint)
+                    print(f"  → Marked as never_sat: {constraint.strip()}")
 
-            # If all temp_unsat constraints have been handled, exit early.
-            if not strike_counts:
+            # Exit early if none remain
+            if not combined_temp_unsat:
                 break
 
-        print(f"\nDEBUG: Final never_sat constraints count: {len(never_sat)}")
+        print(f"DEBUG: Total never_sat: {len(never_sat)}")
         return never_sat
 
     def _get_unsat_core(self, constraints):
@@ -1227,105 +1208,64 @@ class krepairDC:
 
         1. Round-Robin Merge (Phase 1)
            Adjacent chunks (1 and 2, 3 and 4, etc.) are repeatedly merged until no more
-           neighbouring pairs are satisfiable. This phase is executed only when
-           ``first_phase_only`` is ``True``.
+           neighbouring pairs are satisfiable.
 
         2. Merge-As-Much-As-Possible (Phase 2)
            Remaining chunks are considered in size order and greedily merged whenever
            the combined constraints remain satisfiable. The loop stops when an
            iteration produces no successful merges.
-           If first_phase_only is True, Phase 2 is limited to a single
-           iteration (to allow later handling of temporarily-unsat constraints).
         """
         # TODO: split function
 
         tried_chunks = defaultdict(set)
 
-        # PHASE 1: Repeated Round-Robin Merge (only if first_phase_only is True)
-        if first_phase_only:
-            print("\n=== Phase 1: Round-Robin Merge ===")
-            round_robin_changed = True
-            while round_robin_changed:
-                round_robin_changed = False
-                chunk_ids = sorted(valid_by_chunk.keys())
-                if len(chunk_ids) < 2:
-                    break  # nothing to merge if only one chunk remains.
-                # Process adjacent pairs: (chunk_ids[0], chunk_ids[1]), (chunk_ids[2], chunk_ids[3]), etc.
-                for idx in range(0, len(chunk_ids) - 1, 2):
-                    c1 = chunk_ids[idx]
-                    c2 = chunk_ids[idx + 1]
-                    print(f"\nRound-robin pass: Trying to merge Chunk {c1} with Chunk {c2}...")
-                    merged_constraints = valid_by_chunk[c1] + valid_by_chunk[c2]
-                    if self._test_chunk_satisfiability(merged_constraints):
-                        print(f"  ✓ Merge success: {c1} + {c2} → {len(merged_constraints)} constraints")
-                        valid_by_chunk[c1] = merged_constraints
-                        del valid_by_chunk[c2]
-                        round_robin_changed = True
-                    else:
-                        unsat_core = self._get_unsat_core(merged_constraints)
-                        print(f"  ✗ Merge failed: {c1} + {c2} → UNSAT; Unsat Core: {unsat_core}")
-                if round_robin_changed:
-                    print("At least one merge succeeded; re-running round-robin pass...")
-            print("Round-robin merge phase completed.")
-        else:
-            print("Skipping Phase 1 (Round-Robin Merge) because first_phase_only is False.")
-
-        # PHASE 2: Merge-As-Much-As-Possible (general merge phase)
+        # Merge‑As‑Much‑As‑Possible (iterative size‑sorted greedy)
+        print("\n=== Merge As Much As Possible ===")
         iteration = 0
         while True:
             chunk_ids = sorted(valid_by_chunk.keys(), key=lambda cid: len(valid_by_chunk[cid]))
-            if not chunk_ids:
-                break
-
             iteration += 1
             if iteration > 100:
                 print("Breaking merge loop after 100 iterations to prevent infinite loop.")
                 break
 
-            print(f"\n=== Iteration {iteration}: Merge As Much As Possible ===")
-            print(f"Remaining chunks: {chunk_ids}")
+            print(f"\n--- Iteration {iteration} ---")
+            print(f"Remaining chunks (by size): {chunk_ids}")
 
             iteration_merged = False
-            used_this_pass = set()
 
+            # try every pair in size order, break on first success
             for i, c1 in enumerate(chunk_ids):
-                if c1 in used_this_pass:
-                    continue
-                for j in range(i + 1, len(chunk_ids)):
-                    c2 = chunk_ids[j]
-                    if c2 in used_this_pass or c2 in tried_chunks[c1]:
+                for c2 in chunk_ids[i+1:]:
+                    if c2 in tried_chunks[c1]:
                         continue
+
                     print(f"\nPass: Trying to merge Chunk {c1} ({len(valid_by_chunk[c1])} constraints) "
                           f"with Chunk {c2} ({len(valid_by_chunk[c2])} constraints)...")
                     merged_constraints = valid_by_chunk[c1] + valid_by_chunk[c2]
+
                     if self._test_chunk_satisfiability(merged_constraints):
                         print(f"  ✓ Merge success: {c1} + {c2} → {len(merged_constraints)} constraints")
                         valid_by_chunk[c1] = merged_constraints
                         del valid_by_chunk[c2]
-                        used_this_pass.add(c1)
-                        used_this_pass.add(c2)
                         tried_chunks[c1].add(c2)
                         tried_chunks[c2].add(c1)
                         iteration_merged = True
-                        break  # Exit inner loop to update ordering after a merge.
+                        break
                     else:
                         unsat_core = self._get_unsat_core(merged_constraints)
                         print(f"  ✗ Merge failed: {c1} + {c2} → UNSAT; Unsat Core: {unsat_core}")
                         tried_chunks[c1].add(c2)
                         tried_chunks[c2].add(c1)
                 if iteration_merged:
+                    # restart the outer while to re-sort sizes
                     break
 
-            # If first_phase_only is True, exit after the first successful iteration of Phase 2.
-            if first_phase_only and iteration_merged:
-                print("First iteration of merge-as-much-as-possible completed, stopping early for temp_unsat processing.")
-                break
-
             if not iteration_merged:
-                print("No merges succeeded in this iteration. Stopping merge-as-much-as-possible phase.")
+                print("No merges succeeded in this iteration. Stopping merge‑as‑much‑as‑possible phase.")
                 break
             else:
-                print("Merges happened; starting a new iteration of general merging...")
+                print("Merges happened; restarting size‑sorted merge...")
 
         print("\nFinal Merging Completed.")
         final_chunks = sorted(valid_by_chunk.keys(), key=lambda cid: len(valid_by_chunk[cid]))
@@ -1644,7 +1584,7 @@ def process_complete_smt_script(
 def main():
     # Tester/prototyping function
 
-    linux_ksrc = "/home/alexei/LinuxKernels/krepair_alg/pre-study-fixes/linux_copy"
+    linux_ksrc = "/home/alexei/LinuxKernels/krepair_alg/pre-study-fixes/in_order/linux_set40copy"
     existing_config_file = f"{linux_ksrc}/.config"
     unbootable_options_file = "/home/alexei/LinuxKernels/krepair_alg/linux_set50copy/unbootable_options.txt"
     output_dir = f"{linux_ksrc}"
