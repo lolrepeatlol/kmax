@@ -601,35 +601,6 @@ class krepairDC:
         print(f"  Total expressions: {total_exprs}")
         print(f"  Total patch configs: {len(self.patch_constraints)}\n")
 
-        # Create a separate unit for constraints containing "not"
-        #not_constraints = []
-        #new_unit_constraints = defaultdict(list)
-
-        #for unit, constraints in self.unit_constraints.items():
-        #    for constraint in constraints:
-        #        if "not" in constraint:
-        #            not_constraints.append(constraint)  # Store separately
-        #        else:
-        #            new_unit_constraints[unit].append(constraint)  # Keep in original unit
-
-        # Assign the modified unit constraints back
-        #self.unit_constraints = new_unit_constraints
-
-        # Add the new unit for "not" constraints if any exist
-        #if not_constraints:
-        #    self.unit_constraints["not_constraints"] = not_constraints
-
-        # Also reorder self.patch_constraints
-        #not_patch_constraints = [c for c in self.patch_constraints if "not" in c]
-        #self.patch_constraints = [c for c in self.patch_constraints if "not" not in c] + not_patch_constraints
-
-        # Debugging Output (Optional)
-        #print("\n[Debug] Reordered Unit Constraints:")
-        #for unit, constraints in self.unit_constraints.items():
-        #    print(f"Unit: {unit}")
-         #   for c in constraints:
-         #       print(f"  {c}")
-
         print("\n[Debug] Reordered Patch Constraints:")
         for c in self.patch_constraints:
             print(c)
@@ -968,19 +939,24 @@ class krepairDC:
     def _process_temp_unsat(self, all_temp_unsat, valid_by_chunk):
         """
         Processing for temp_unsat constraints.
-        For each group in valid_by_chunk, we test each candidate constraint once:
-        - If it is satisfiable, permanently add it to the group.
-        - Otherwise, mark it as never_sat immediately.
+        For each group in valid_by_chunk we create one solver instance.
+        For each candidate temp_unsat constraint we push a new context, add it (with its full
+        declarations) to the group’s solver, and test for satisfiability.
+        If it is sat, we pop and then permanently add it (updating the group's declared tokens)
+        and stop trying other groups.
+        If it is unsat in every group, it is marked as never_sat.
         """
         never_sat = set()
 
-        # Combine all temp_unsat constraints into a unique list
+        # Combine all temp_unsat constraints into a unique list.
         combined_temp_unsat = set()
         for constraints in all_temp_unsat.values():
             combined_temp_unsat.update(constraints)
         combined_temp_unsat = list(combined_temp_unsat)
 
-        # Helper to parse a candidate constraint
+        # Helper: Given a candidate constraint and the set of tokens already declared for the group,
+        # build an SMT2 snippet that declares the union of all tokens (group tokens and candidate tokens)
+        # and then asserts the candidate constraint.
         def parse_candidate_constraint(constraint, group_declared_tokens):
             candidate_tokens = set(re.findall(r"(CONFIG_[A-Z0-9_]+)", constraint))
             all_tokens = group_declared_tokens.union(candidate_tokens)
@@ -989,7 +965,7 @@ class krepairDC:
             exprs = z3.parse_smt2_string(full_script, ctx=self.arch_baseline_solver.ctx)
             return exprs, candidate_tokens
 
-        # Create one solver per group and track declared tokens
+        # Create one solver per group and track declared tokens for each group.
         solvers = {}
         solver_declared_tokens = {}
         for group_id, constraints in valid_by_chunk.items():
@@ -1003,36 +979,41 @@ class krepairDC:
             solvers[group_id] = solver
             solver_declared_tokens[group_id] = declared
 
-        # Process groups in order of increasing size
+        # Try groups in increasing-size order
         sorted_group_ids = sorted(valid_by_chunk.keys(), key=lambda cid: len(valid_by_chunk[cid]))
-        for group_id in sorted_group_ids:
-            solver = solvers[group_id]
-            print(f"Processing temp_unsat for group {group_id} (size: {len(valid_by_chunk[group_id])})")
 
-            # Test each candidate once
-            for constraint in combined_temp_unsat[:]:  # iterate over copy
+        # For each temp_unsat constraint, try to add it to the first group that accepts it.
+        for constraint in list(combined_temp_unsat):
+            print(f"\nTrying to place constraint: {constraint.strip()}")
+            placed = False
+
+            for group_id in sorted_group_ids:
+                solver = solvers[group_id]
+                print(f" Processing group {group_id} (size {len(valid_by_chunk[group_id])})")
                 solver.push()
                 exprs, candidate_tokens = parse_candidate_constraint(constraint, solver_declared_tokens[group_id])
                 solver.add(*exprs)
                 if solver.check() == z3.sat:
                     solver.pop()
-                    # Permanently add the constraint
+                    # permanently add to this group
                     exprs, candidate_tokens = parse_candidate_constraint(constraint, solver_declared_tokens[group_id])
                     solver.add(*exprs)
                     solver_declared_tokens[group_id].update(candidate_tokens)
                     valid_by_chunk[group_id].append(constraint)
                     combined_temp_unsat.remove(constraint)
-                    print(f"  ✓ Added constraint: {constraint.strip()}")
+                    print(f"  ✓ Added to group {group_id}")
+                    placed = True
+                    break
                 else:
                     solver.pop()
-                    never_sat.add(constraint)
-                    print(f"  → Marked as never_sat: {constraint.strip()}")
+                    print(f"  × Rejected by group {group_id}")
 
-            # Exit early if none remain
-            if not combined_temp_unsat:
-                break
+            if not placed:
+                never_sat.add(constraint)
+                combined_temp_unsat.remove(constraint)
+                print(f"  → Marked as never_sat: {constraint.strip()}")
 
-        print(f"DEBUG: Total never_sat: {len(never_sat)}")
+        print(f"\nDEBUG: Final never_sat constraints count: {len(never_sat)}")
         return never_sat
 
     def _get_unsat_core(self, constraints):
@@ -1202,18 +1183,12 @@ class krepairDC:
 
     def _attempt_merge_chunks(self, valid_by_chunk, first_phase_only=False):
         """
-        Attempts to merge satisfiable chunks of patch constraints.
+        Attempts to merge satisfiable chunks of patch constraints
+        by merging as much as possible (greedily).
 
-        The merge process can run in one or two phases:
-
-        1. Round-Robin Merge (Phase 1)
-           Adjacent chunks (1 and 2, 3 and 4, etc.) are repeatedly merged until no more
-           neighbouring pairs are satisfiable.
-
-        2. Merge-As-Much-As-Possible (Phase 2)
-           Remaining chunks are considered in size order and greedily merged whenever
-           the combined constraints remain satisfiable. The loop stops when an
-           iteration produces no successful merges.
+        Chunks are considered in size order and greedily merged whenever
+        the combined constraints remain satisfiable. The loop stops when an
+        iteration produces no successful merges.
         """
         # TODO: split function
 
@@ -1512,7 +1487,6 @@ def process_complete_smt_script(
             print("Debug: arch_smt2_str is empty, no arch constraints added.")
 
         # 1.2) pull in *all* per‑arch constraints via the helper
-        # TODO: look into using existing baseline solver instead of pulling arch constraints again
         arch = Arch(arch_name)
         extra_arch_exprs = [
             expr.translate(ctx) for expr in arch.get_arch_specific_constraints()
