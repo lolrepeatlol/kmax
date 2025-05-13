@@ -968,10 +968,9 @@ class krepairDC:
         For each group in valid_by_chunk we create one solver instance.
         For each candidate temp_unsat constraint we push a new context, add it (with its full
         declarations) to the group’s solver, and test for satisfiability.
-        If it is sat, we pop and then permanently add it (updating the group's declared tokens).
-        If unsat, we pop, increment a strike, and once the candidate has reached the maximum
-        allowed attempts (3 if there are 3+ groups, or equal to the number of groups if fewer),
-        it is marked as never_sat.
+        If it is sat, we pop and then permanently add it (updating the group's declared tokens)
+        and stop trying other groups.
+        If it is unsat in every group, it is marked as never_sat.
         """
         never_sat = set()
 
@@ -981,15 +980,9 @@ class krepairDC:
             combined_temp_unsat.update(constraints)
         combined_temp_unsat = list(combined_temp_unsat)
 
-        # Initialize strike counts.
-        strike_counts = {c: 0 for c in combined_temp_unsat}
-        group_count = len(valid_by_chunk)
-        max_attempts = 3 if group_count >= 3 else group_count
-
         # Helper: Given a candidate constraint and the set of tokens already declared for the group,
         # build an SMT2 snippet that declares the union of all tokens (group tokens and candidate tokens)
         # and then asserts the candidate constraint.
-        # Returns the parsed expressions and the candidate's tokens (to update the group's declared set later).
         def parse_candidate_constraint(constraint, group_declared_tokens):
             candidate_tokens = set(re.findall(r"(CONFIG_[A-Z0-9_]+)", constraint))
             all_tokens = group_declared_tokens.union(candidate_tokens)
@@ -1003,56 +996,52 @@ class krepairDC:
         solver_declared_tokens = {}
         for group_id, constraints in valid_by_chunk.items():
             solver = z3.Solver(ctx=self.arch_baseline_solver.ctx)
-            # Add baseline assertions.
             solver.append(*self.arch_baseline_solver.assertions())
             declared = set()
             for cons in constraints:
-                # For each valid constraint, build a full SMT2 snippet that includes all needed declarations.
                 exprs, tokens = parse_candidate_constraint(cons, declared)
                 solver.add(*exprs)
                 declared.update(tokens)
             solvers[group_id] = solver
             solver_declared_tokens[group_id] = declared
 
-        # Process groups in order of increasing size.
+        # Try groups in increasing-size order
         sorted_group_ids = sorted(valid_by_chunk.keys(), key=lambda cid: len(valid_by_chunk[cid]))
-        for group_id in sorted_group_ids:
-            solver = solvers[group_id]
-            print(f"Processing temp_unsat constraints for group {group_id} (current size: {len(valid_by_chunk[group_id])})")
-            # Iterate over a copy of the remaining candidate constraints.
-            for constraint in list(strike_counts.keys()):
+
+        # For each temp_unsat constraint, try to add it to the first group that accepts it.
+        for constraint in list(combined_temp_unsat):
+            print(f"\nTrying to place constraint: {constraint.strip()}")
+            placed = False
+
+            for group_id in sorted_group_ids:
+                solver = solvers[group_id]
+                print(f" Processing group {group_id} (size {len(valid_by_chunk[group_id])})")
                 solver.push()
-                # Build the SMT2 snippet for the candidate using the union of declared tokens and candidate tokens.
                 exprs, candidate_tokens = parse_candidate_constraint(constraint, solver_declared_tokens[group_id])
                 solver.add(*exprs)
-                result = solver.check()
-                if result == z3.sat:
-                    solver.pop()  # Remove the temporary addition.
-                    # Permanently add the candidate constraint.
+                if solver.check() == z3.sat:
+                    solver.pop()
+                    # permanently add to this group
                     exprs, candidate_tokens = parse_candidate_constraint(constraint, solver_declared_tokens[group_id])
                     solver.add(*exprs)
-                    # Update the group's declared tokens.
                     solver_declared_tokens[group_id].update(candidate_tokens)
                     valid_by_chunk[group_id].append(constraint)
-                    # Explicitly remove from tempunsat
                     combined_temp_unsat.remove(constraint)
-                    print(f"  ✓ Added constraint to group {group_id}: {constraint.strip()}")
-                    del strike_counts[constraint]
+                    print(f"  ✓ Added to group {group_id}")
+                    placed = True
+                    break
                 else:
-                    solver.pop()  # Revert the temporary addition.
-                    strike_counts[constraint] += 1
-                    print(f"  × Constraint failed for group {group_id}: {constraint.strip()} (strike {strike_counts[constraint]})")
-                    if strike_counts[constraint] >= max_attempts:
-                        never_sat.add(constraint)
-                        print(f"  → Marked as never_sat: {constraint.strip()}")
-                        del strike_counts[constraint]
+                    solver.pop()
+                    print(f"  × Rejected by group {group_id}")
 
-            # If all temp_unsat constraints have been handled, exit early.
-            if not strike_counts:
-                break
+            if not placed:
+                never_sat.add(constraint)
+                combined_temp_unsat.remove(constraint)
+                print(f"  → Marked as never_sat: {constraint.strip()}")
 
         print(f"\nDEBUG: Final never_sat constraints count: {len(never_sat)}")
         return never_sat
+
 
     def _get_unsat_core(self, constraints):
         """
