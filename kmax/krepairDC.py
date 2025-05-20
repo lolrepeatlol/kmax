@@ -944,7 +944,9 @@ class krepairDC:
         declarations) to the group’s solver, and test for satisfiability.
         If it is sat, we pop and then permanently add it (updating the group's declared tokens)
         and stop trying other groups.
-        If it is unsat in every group, it is marked as never_sat.
+        If it is unsat in every group, we then test it on its own (with only arch constraints).
+        - If still unsat, mark as never_sat.
+        - If sat, make a new group containing just that constraint.
         """
         never_sat = set()
 
@@ -965,7 +967,7 @@ class krepairDC:
             exprs = z3.parse_smt2_string(full_script, ctx=self.arch_baseline_solver.ctx)
             return exprs, candidate_tokens
 
-        # Create one solver per group and track declared tokens for each group.
+        # Build one solver per existing group
         solvers = {}
         solver_declared_tokens = {}
         for group_id, constraints in valid_by_chunk.items():
@@ -982,11 +984,11 @@ class krepairDC:
         # Try groups in increasing-size order
         sorted_group_ids = sorted(valid_by_chunk.keys(), key=lambda cid: len(valid_by_chunk[cid]))
 
-        # For each temp_unsat constraint, try to add it to the first group that accepts it.
         for constraint in list(combined_temp_unsat):
             print(f"\nTrying to place constraint: {constraint.strip()}")
             placed = False
 
+            # 1) Try to fit into any existing group
             for group_id in sorted_group_ids:
                 solver = solvers[group_id]
                 print(f" Processing group {group_id} (size {len(valid_by_chunk[group_id])})")
@@ -1008,10 +1010,29 @@ class krepairDC:
                     solver.pop()
                     print(f"  × Rejected by group {group_id}")
 
+            # 2) If it didn't fit anywhere, try it on its own
             if not placed:
-                never_sat.add(constraint)
-                combined_temp_unsat.remove(constraint)
-                print(f"  → Marked as never_sat: {constraint.strip()}")
+                print(f" Trying to place on its own")
+                # build a fresh solver with only arch constraints
+                solo_solver = z3.Solver(ctx=self.arch_baseline_solver.ctx)
+                solo_solver.append(*self.arch_baseline_solver.assertions())
+                exprs, tokens = parse_candidate_constraint(constraint, set())
+                solo_solver.add(*exprs)
+
+                if solo_solver.check() == z3.sat:
+                    # create a new group for this single constraint
+                    new_group_id = max(valid_by_chunk.keys(), default=-1) + 1
+                    valid_by_chunk[new_group_id] = [constraint]
+                    solvers[new_group_id] = solo_solver
+                    solver_declared_tokens[new_group_id] = tokens
+                    combined_temp_unsat.remove(constraint)
+                    # re-sort groups so future constraints see the new group
+                    sorted_group_ids = sorted(valid_by_chunk.keys(), key=lambda cid: len(valid_by_chunk[cid]))
+                    print(f"  + Created new group {new_group_id} for constraint")
+                else:
+                    never_sat.add(constraint)
+                    combined_temp_unsat.remove(constraint)
+                    print(f"  → Marked as never_sat: {constraint.strip()}")
 
         print(f"\nDEBUG: Final never_sat constraints count: {len(never_sat)}")
         return never_sat
