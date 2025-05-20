@@ -14,6 +14,7 @@ import enum
 import z3
 import time
 import fnmatch
+from typing import Optional
 from functools import reduce
 from kmax.arch import Arch
 from kmax.common import get_kmax_constraints, unpickle_kmax_file
@@ -580,10 +581,12 @@ class Klocalizer:
     random_seed -- random seed to be used by the internal z3 solver.
     logger -- Logger.
     """
-    def __init__(self, constraints: list, approximate_constraints=None, random_seed=None, logger=None):
+    def __init__(self, constraints: list, approximate_constraints=None, ctx: Optional[z3.Context] = None, random_seed=None, logger=None):
       self.set_logger(logger)
 
-      self.__solver = z3.Solver()
+      # create the solver in the specific context/z3 default context
+      self.__ctx     = ctx or z3.main_ctx()
+      self.__solver = z3.Solver(ctx=self.__ctx)
       self.__solver.set(unsat_core=True)
 
       if random_seed != None:
@@ -723,138 +726,6 @@ class Klocalizer:
         return True, model
         
       assert False # should've returned above
-
-    def convert_constraint_to_ctx(constraint, ctx):
-      constraint_str = constraint.sexpr()
-      # Extract variable names from the constraint (customize regex as needed)
-      var_names = set(re.findall(r'CONFIG_[A-Za-z0-9_]+', constraint_str))
-      # Build declarations for all variables
-      declarations = "\n".join(f"(declare-const {var} Bool)" for var in var_names)
-      smt_script = f"(set-logic QF_UF)\n{declarations}\n(assert {constraint_str})"
-      parsed = z3.parse_smt2_string(smt_script, ctx=ctx)
-      # Return the first parsed constraint (assumes one constraint per script)
-      return parsed[0] if parsed else None
-
-    def sample_model_with_ctx(self, ctx):
-      # Create a fresh solver in the provided context
-      new_solver = z3.Solver(ctx=ctx)
-      new_solver.set(unsat_core=True)
-
-      # Add all constraints
-      new_solver.add(self.__constraints)
-      print(f"[DEBUG] Added {len(new_solver.assertions())} constraints to solver")
-
-      # Check if we have approximate constraints
-      if not self.__approximate_constraints:
-        # No approximation, just check satisfiability
-        is_sat = new_solver.check() == z3.sat
-        if is_sat:
-          model = new_solver.model()
-          return True, model
-        else:
-          unsat_core = new_solver.unsat_core()
-          return False, unsat_core
-
-      # If we reach here, we have approximate constraints
-      print(f"Approximating model with {len(self.__approximate_constraints)} constraints")
-
-      # Convert approximate constraints to the current context if needed
-      assumptions = []
-      for constraint in self.__approximate_constraints:
-        try:
-          if constraint.ctx == ctx:
-            assumptions.append(constraint)
-          else:
-            # Try to convert the constraint to the current context
-            try:
-              # First try direct conversion
-              for constraint in self.__approximate_constraints:
-                try:
-                  if constraint.ctx == ctx:
-                    assumptions.append(constraint)
-                  else:
-                    converted = self.convert_constraint_to_ctx(constraint, ctx)
-                    if converted is not None:
-                      assumptions.append(converted)
-                    else:
-                      print(f"[WARNING] Could not convert constraint: {constraint.sexpr()}")
-                except Exception as e:
-                  print(f"[WARNING] Skipping constraint during approximation: {e}")
-                  continue
-            except:
-              # If that fails, try parsing as SMT-LIB
-              constraint_str = constraint.sexpr()
-              smt_script = "(set-logic QF_UF)\n"
-              var_names = re.findall(r'CONFIG_[A-Za-z0-9_]+', constraint_str)
-              for var in var_names:
-                smt_script += f"(declare-const {var} Bool)\n"
-              smt_script += f"(assert {constraint_str})\n"
-
-              try:
-                parsed = z3.parse_smt2_string(smt_script, ctx=ctx)
-                if parsed:
-                  assumptions.append(parsed[0])
-              except:
-                # If all else fails, skip this constraint
-                print(f"[WARNING] Skipping complex constraint: {constraint_str}")
-        except Exception as e:
-          print(f"[WARNING] Skipping constraint during approximation: {e}")
-          continue
-
-      print(f"[DEBUG] Converted {len(assumptions)} approximate constraints to current context")
-
-      # Check basic satisfiability first (without assumptions)
-      basic_sat = new_solver.check() == z3.sat
-      print(f"[DEBUG] Basic satisfiability (without assumptions): {'SAT' if basic_sat else 'UNSAT'}")
-
-      # Check with assumptions
-      is_approx_sat = new_solver.check(assumptions) == z3.sat
-      if is_approx_sat:
-        print("[INFO] Already satisfiable when constraining with given config. No approximation needed.")
-        # Get model with assumptions applied
-        model = new_solver.model()
-        return True, model
-
-      # If not satisfiable with all assumptions, try removing some
-      print("[INFO] Approximating via unsat core approach.")
-      total_assumptions = len(assumptions)
-      removed_count = 0
-
-      while not is_approx_sat and assumptions:
-        core = new_solver.unsat_core()
-        #print(f"[DEBUG] New implementation - Unsat core size: {len(core)}")
-
-        # Handle empty unsat core
-        if len(core) == 0:
-          print("[WARNING] Empty unsat core, cannot proceed with approximation")
-          break
-        else:
-          # Normal case - remove constraints in the unsat core
-          #print(f"[DEBUG] New implementation - First few core constraints: {[str(c) for c in list(core)[:5]]}")
-
-          # Remove constraints in the unsat core
-          before_len = len(assumptions)
-          assumptions = [a for a in assumptions if a not in core]
-          after_len = len(assumptions)
-          removed_this_iteration = before_len - after_len
-          removed_count += removed_this_iteration
-
-          # If we didn't remove any constraints, we're stuck
-          if removed_this_iteration == 0:
-            print("[WARNING] No constraints removed in this iteration, cannot proceed")
-            break
-
-          # Check if satisfiable with the reduced set of assumptions
-          is_approx_sat = new_solver.check(assumptions) == z3.sat
-
-      if is_approx_sat:
-        print(f"[INFO] Found satisfying config by removing {removed_count} assumptions.")
-        # Get model with remaining assumptions applied
-        model = new_solver.model()
-        return True, model
-      else:
-        print(f"[WARNING] Could not find satisfying approximation after removing {removed_count} assumptions")
-        return False, new_solver.unsat_core()
 
   def set_linux_krsc(self, ksrc_dir):
     self.__ksrc=ksrc_dir

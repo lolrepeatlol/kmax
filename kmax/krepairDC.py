@@ -715,7 +715,7 @@ class krepairDC:
             elif total_unique < 1000:
                 return min(12, num_threads)
             else:
-                return min(num_threads, max(8, total_unique // 150))
+                return min(num_threads, max(8, total_unique // 100))
 
         def distribute_constraints(unique_constraints, num_chunks):
             """
@@ -1259,10 +1259,22 @@ class krepairDC:
 
         It checks satisfiability of the combined formula using Z3. If satisfiable, a
         kernel configuration is generated from the model and saved to the output
-        directory. Debug files, including the full SMT formula and model statistics,
-        are also written for each group.
+        directory.
         """
         # TODO: break function into smaller parts & simplify
+
+        def _to_arch_ctx(exprs):
+            """
+            Translate every BoolRef in *exprs* into self.arch_ctx.
+            Skip expressions that cannot be translated.
+            """
+            out = []
+            for e in exprs:
+                try:
+                    out.append(e if e.ctx == self.arch_ctx else e.translate(self.arch_ctx))
+                except z3.Z3Exception as err:
+                    print(f"[WARN] skipping constraint that can’t translate: {err}")
+            return out
 
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
@@ -1271,53 +1283,16 @@ class krepairDC:
 
         print("\n[INFO] Generating repaired configuration files...\n")
 
-        # Parse architecture constraints if we haven't already
-        if not self.arch_baseline_solver.assertions():
-            print("[ERROR] Parsed arch constraints are empty! Check parsing step.")
+        # Check if architecture constraints are present
+        assert self.arch_baseline_solver.assertions()
 
         # Get approximate constraints from existing config
         approx_constraints_raw = Klocalizer.get_config_file_constraints(self.existing_config_path)
         print(f"[DEBUG] Loaded {len(approx_constraints_raw)} approximate constraints from config")
 
-        # Convert approximate constraints to the architecture context
-        approx_constraints = []
-        for constraint in approx_constraints_raw:
-            try:
-                # Convert the constraint to the architecture context
-                if constraint.ctx == self.arch_ctx:
-                    approx_constraints.append(constraint)
-                else:
-                    # Parse the constraint in the architecture context
-                    constraint_str = constraint.sexpr()
-                    # We need to wrap it in a proper SMT-LIB script
-                    smt_script = "(set-logic QF_UF)\n"
-                    # Extract variable names from the constraint
-                    var_names = re.findall(r'CONFIG_[A-Za-z0-9_]+', constraint_str)
-                    for var in var_names:
-                        smt_script += f"(declare-const {var} Bool)\n"
-                    smt_script += f"(assert {constraint_str})\n"
-
-                    try:
-                        parsed = z3.parse_smt2_string(smt_script, ctx=self.arch_ctx)
-                        if parsed:
-                            approx_constraints.append(parsed[0])
-                    except Exception as e:
-                        print(f"[WARNING] Failed to parse constraint in architecture context: {e}")
-                        # Fallback: try to create a direct BoolVal
-                        try:
-                            if constraint.is_true():
-                                approx_constraints.append(z3.BoolVal(True, self.arch_ctx))
-                            elif constraint.is_false():
-                                approx_constraints.append(z3.BoolVal(False, self.arch_ctx))
-                            else:
-                                # Skip this constraint as we can't convert it properly
-                                print(f"[WARNING] Skipping complex constraint: {constraint_str}")
-                        except:
-                            print(f"[WARNING] Skipping constraint that couldn't be converted: {constraint_str}")
-            except Exception as e:
-                print(f"[WARNING] Error processing constraint: {e}")
-
-        print(f"[DEBUG] Converted {len(approx_constraints)} approximate constraints to architecture context")
+        # Translate constraints to the architecture context
+        approx_constraints = _to_arch_ctx(approx_constraints_raw)
+        print(f"[DEBUG] Converted {len(approx_constraints)} approximate constraints")
 
         groups = self.merged_groups if hasattr(self, "merged_groups") and self.merged_groups else {1: self.patch_constraints}
 
@@ -1373,37 +1348,16 @@ class krepairDC:
                 with open(f"full_constraints_group_{group_id}.smt2", "w") as f:
                     f.write(smt_script_full)
 
-                # Check basic satisfiability without approximate constraints
-                basic_solver = z3.Solver(ctx=self.arch_ctx)
-                basic_solver.add(full_constraints)
-                basic_sat = basic_solver.check() == z3.sat
-
-                if basic_sat:
-                    print(f"[INFO] Constraint group {group_id} is satisfiable without approximate constraints")
-
-                    # Get a model directly from the basic solver
-                    basic_model = basic_solver.model()
-                    print(f"[DEBUG] Basic model declarations: {len(basic_model.decls())}")
-                    print(f"[DEBUG] Basic model True assignments: {sum(1 for d in basic_model.decls() if basic_model[d] == True)}")
-
-                else:
-                    print(f"[WARNING] Constraint group {group_id} is UNSATISFIABLE without approximate constraints")
-
-                    # Get the unsat core
-                    unsat_core = basic_solver.unsat_core()
-                    print(f"[DEBUG] Basic unsat core size: {len(unsat_core)}")
-                    if unsat_core:
-                        print(f"[DEBUG] First few core constraints: {[str(c) for c in list(unsat_core)[:5]]}")
-
                 # Create model sampler with the full constraints
                 model_sampler = Klocalizer.Z3ModelSampler(
                     full_constraints,
                     approximate_constraints=approx_constraints,
+                    ctx=self.arch_ctx,
                     random_seed=None,
                     logger=None
                 )
 
-                is_sat, result = model_sampler.sample_model_with_ctx(self.arch_ctx)
+                is_sat, result = model_sampler.sample_model()
 
                 if is_sat:
                     model = result
@@ -1558,7 +1512,7 @@ def process_complete_smt_script(
 def main():
     # Tester/prototyping function
 
-    linux_ksrc = "/home/alexei/LinuxKernels/krepair_alg/pre-study-fixes/in_order/linux_set40copy"
+    linux_ksrc = "/home/alexei/LinuxKernels/krepair_alg/pre-study-fixes/cleanup/linux_300commitset_copy_post_all_changes"
     existing_config_file = f"{linux_ksrc}/.config"
     unbootable_options_file = "/home/alexei/LinuxKernels/krepair_alg/linux_set50copy/unbootable_options.txt"
     output_dir = f"{linux_ksrc}"
