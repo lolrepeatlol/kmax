@@ -529,7 +529,7 @@ class krepairDC:
             with ProcessPoolExecutor(max_workers=num_processes) as ex:
                 futures = {
                     ex.submit(
-                        process_complete_smt_script,
+                        iteratively_test_constraints,
                         scripts[i],
                         i,
                         indexes_by_chunk[i],
@@ -784,112 +784,49 @@ class krepairDC:
 
     def _get_unsat_core(self, constraints):
         """
-        Attempts to extract an unsatisfiable core from a list of SMT constraints.
-
-        For each constraint, a fresh Boolean assumption (e.g. ``a0``, ``a1``, ...) is declared,
-        and the constraint is rewritten as an implication: ``(=> ai <constraint>)``. A solver
-        is created with unsat core tracking enabled, and the function checks satisfiability
-        under these assumptions.
-
-        If the constraints are unsatisfiable, the solver returns an unsat core containing
-        some of the assumptions. This function then maps each assumption in the core
-        back to the list of ``CONFIG_*`` options that appeared in the corresponding constraint.
+        Return { 'a<i>': [CONFIG_…] } for the constraints that
+        participate in the unsat core, or None if the whole set is sat/unknown.
         """
-        # TODO: implement much simpler & more robust unsat core extraction
+        # 1. Collect CONFIG_* symbols we might need to declare
+        all_cfg_ids = {cfg for ct in constraints
+                       for cfg in self.DECL_PATTERN.findall(ct)}
 
-        def strip_outer_assert(constraint_text):
-            """
-            Removes an outer (assert …) wrapper if present.
-            This simple function assumes a well-formed single assertion.
-            """
-            s = constraint_text.strip()
-            if s.startswith("(assert"):
-                s = s[len("(assert"):].strip()
-                if s and s[-1] == ")":
-                    s = s[:-1].strip()
-            return s
-
-        # 1. Extract all CONFIG_* symbols from the constraints.
-        config_ids = set()
-        for ct in constraints:
-            config_ids.update(self.DECL_PATTERN.findall(ct))
-
-        # 2. Gather user patch declarations (if available) and determine which CONFIG_* are already declared.
         declared_ids = set()
-        patch_decl_text = ""
-        if hasattr(self, 'patch_declarations') and self.patch_declarations:
-            patch_decl_text = "\n".join(self.patch_declarations)
-            declared_ids = set(re.findall(r"\(declare-const\s+([A-Z0-9_]+)\s+Bool\)", patch_decl_text))
+        if self.patch_declarations:
+            declared_ids = {m.group(1)
+                            for d in self.patch_declarations
+                            for m in [re.match(r"\(declare-const\s+([A-Z0-9_]+)\s+Bool\)", d)]
+                            if m}
 
-        # 3. Auto-declare any missing CONFIG_* symbols.
-        auto_decls = []
-        for cfg in sorted(config_ids):
-            if cfg not in declared_ids:
-                auto_decls.append(f"(declare-const {cfg} Bool)")
-        auto_decl_text = "\n".join(auto_decls)
+        auto_decl_text = "\n".join(f"(declare-const {cfg} Bool)"
+                                   for cfg in sorted(all_cfg_ids - declared_ids))
 
-        # 4. Build the SMT2 script.
-        script_lines = []
-        # Set logic and enable unsat core production.
-        script_lines.append("(set-logic QF_UF)")
-        script_lines.append("(set-option :produce-unsat-cores true)")
-        if patch_decl_text:
-            script_lines.append(patch_decl_text)
-        if auto_decl_text:
-            script_lines.append(auto_decl_text)
+        header = "(set-logic QF_UF)\n" \
+                 + "\n".join(self.patch_declarations) + "\n" \
+                 + auto_decl_text + "\n"
 
-        # 5. For each constraint, declare a fresh Boolean assumption.
-        num_constraints = len(constraints)
-        for idx in range(num_constraints):
-            script_lines.append(f"(declare-const a{idx} Bool)")
-
-        # 6. Build a mapping from assumption name to config options in that constraint.
-        constraint_config_map = {}
-        for idx, ct in enumerate(constraints):
-            inner = strip_outer_assert(ct)
-            # Extract CONFIG_* options from the inner expression.
-            config_options = self.DECL_PATTERN.findall(inner)
-            constraint_config_map[f"a{idx}"] = config_options
-            # Assert the implication using the assumption a{idx}.
-            script_lines.append(f"(assert (=> a{idx} {inner}))")
-
-        final_script = "\n".join(script_lines)
-        # print("Final SMT2 script:\n", final_script)
-
-        # 7. Create a fresh solver with unsat core tracking enabled.
-        solver = z3.Solver(ctx=self.arch_baseline_solver.ctx)
+        # 2. Build a fresh solver, copy arch baseline
+        ctx    = self.arch_baseline_solver.ctx
+        solver = z3.Solver(ctx=ctx)
         solver.set(unsat_core=True)
-        try:
-            solver.append(*self.arch_baseline_solver.assertions())
-        except Exception as e:
-            print(f"[ERROR] Failed to re-add baseline assertions: {e}")
+        solver.append(*self.arch_baseline_solver.assertions())
+
+        # 3. Feed every constraint with assert-and-track
+        tag_to_cfgs = {}
+        for idx, ct in enumerate(constraints):
+            tag = z3.Bool(f"a{idx}", ctx=ctx)
+            expr = z3.parse_smt2_string(header + ct, ctx=ctx)[0]   # parse returns a list
+            solver.assert_and_track(expr, tag)
+            tag_to_cfgs[tag.decl().name()] = self.DECL_PATTERN.findall(ct)
+
+        # 4. Check & extract core
+        res = solver.check()
+        if res != z3.unsat:
+            print(f"[INFO]  set was {res}; unsat core not available")
             return None
 
-        try:
-            parsed = z3.parse_smt2_string(final_script, ctx=self.arch_baseline_solver.ctx)
-            solver.add(parsed)
-        except Exception as e:
-            print(f"[ERROR] parse_smt2_string failed in get_unsat_core: {e}")
-            return None
-
-        # 8. Create a list of assumption literals using z3.Bool with the solver's context.
-        assumption_literals = [z3.Bool(f"a{idx}", ctx=solver.ctx) for idx in range(num_constraints)]
-        # 9. Check the solver with these assumptions (passed as positional arguments).
-        res = solver.check(*assumption_literals)
-        if res == z3.sat:
-            print("[INFO] Unexpected: constraints are satisfiable when attempting to get unsat core.")
-            return None
-        elif res == z3.unknown:
-            print("[WARNING] Solver returned unknown for unsat core check.")
-            return None
-        else:
-            core = solver.unsat_core()
-            # Build a mapping from unsat assumption names to config options.
-            unsat_mapping = {}
-            for item in core:
-                item_name = str(item)
-                unsat_mapping[item_name] = constraint_config_map.get(item_name, [])
-            return unsat_mapping
+        core = solver.unsat_core()               # list[BoolRef] returned by solver
+        return {str(t): tag_to_cfgs[str(t)] for t in core}
 
     def _test_chunk_satisfiability(self, constraints):
         """
@@ -1163,7 +1100,7 @@ class krepairDC:
 
         return constraints
 
-def process_complete_smt_script(
+def iteratively_test_constraints(
         full_script,
         chunk_idx,
         global_indexes,
@@ -1275,7 +1212,7 @@ def process_complete_smt_script(
 def main():
     # Tester/prototyping function
 
-    linux_ksrc = "/home/alexei/LinuxKernels/krepair_alg/pre-study-fixes/cleanup/linux_set50copy_koverage"
+    linux_ksrc = "/home/alexei/LinuxKernels/krepair_alg/pre-study-fixes/cleanup/linux_other300commitset_newunsatcore"
     existing_config_file = f"{linux_ksrc}/.config"
     output_dir = f"{linux_ksrc}"
 
