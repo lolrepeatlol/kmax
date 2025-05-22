@@ -648,9 +648,9 @@ class Klocalizer:
         self.__logger.info("Already satisfiable when constraining with given config.  No approximatation needed.\n")
       else:
         core = solver.unsat_core()
-        print(f"[DEBUG] Old implementation - Unsat core size: {len(core)}")
+        print(f"[DEBUG] Unsat core size: {len(core)}")
         if len(core) > 0:
-          print(f"[DEBUG] Old implementation - First few core constraints: {[str(c) for c in list(core)[:5]]}")
+          print(f"[DEBUG] First few core constraints: {[str(c) for c in list(core)[:5]]}")
 
         self.__logger.info("Approximating via unsat core approach.\n")
         total_assumptions_to_match = len(assumptions)
@@ -664,9 +664,9 @@ class Klocalizer:
           core = solver.unsat_core()
 
           # Print each unsat core iteration
-          print(f"[DEBUG] Old implementation - Unsat core iteration {iteration}, size: {len(core)}")
+          print(f"[DEBUG] Unsat core iteration {iteration}, size: {len(core)}")
           if len(core) > 0:
-            print(f"[DEBUG] Old implementation - First few core constraints: {[str(c) for c in list(core)[:5]]}")
+            print(f"[DEBUG] First few core constraints: {[str(c) for c in list(core)[:5]]}")
 
           # Count how many assumptions are being removed
           before_len = len(assumptions)
@@ -678,14 +678,14 @@ class Klocalizer:
           removed_this_iteration = before_len - after_len
           removed_count += removed_this_iteration
 
-          print(f"[DEBUG] Old implementation - Removed {removed_this_iteration} assumptions in this iteration, {removed_count} total so far")
+          print(f"[DEBUG] Removed {removed_this_iteration} assumptions in this iteration, {removed_count} total so far")
 
           self.__logger.debug("%s\r" % len(assumptions))
           is_sat = solver.check(assumptions) == z3.sat
 
         self.__logger.debug("\r")
         self.__logger.info("Found satisfying config by removing %d assumptions.\n" % (total_assumptions_to_match - len(assumptions)))
-        print(f"[INFO] Old implementation - Found satisfying config by removing {removed_count} assumptions.")
+        print(f"[INFO] Found satisfying config by removing {removed_count} assumptions.")
 
     def sample_model(self):
       """If sat, return (True, z3_model)

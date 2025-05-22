@@ -1,6 +1,5 @@
 import time
 from typing import List
-import networkx as nx
 import z3
 import re
 from tqdm import tqdm
@@ -62,9 +61,6 @@ class krepairDC:
         self.linux_ksrc = linux_ksrc  # Path to the Linux kernel source directory
         self.arch_smt2_str = ""
         self.arch_baseline_solver = None  # Solver for architecture-specific constraints
-
-        self.dependency_graph = nx.DiGraph()
-        self.unbootable_options = set() # about to be axed
 
         self.patch_constraints = []  # List of patch constraints (SMT2 strings)
         self.patch_declarations = set()  # Set of SMT2 declarations for configuration symbols
@@ -172,187 +168,20 @@ class krepairDC:
 
             # 3) add everything
             self.arch_baseline_solver.add(arch_exprs)
-            print(f"[debug] arch baseline solver initialized with {len(arch_exprs)} constraints")
+            print(f"[debug] Arch baseline solver initialized with {len(arch_exprs)} constraints")
 
             # 4) add Not(CONFIG_BROKEN) constraint
             CONFIG_BROKEN = z3.Bool("CONFIG_BROKEN", ctx=self.arch_ctx)
             self.arch_baseline_solver.add(z3.Not(CONFIG_BROKEN))
 
         except Exception as e:
-            print(f"[error] initializing arch baseline solver: {e}")
+            print(f"[error] Initializing arch baseline solver: {e}")
             self.arch_baseline_solver = None
-
-    def build_kconfig_dependency_graph(self, content):
-        """
-        Build dependency graph from kextract output using kclause-style parsing.
-        We'll store edges in the direction: DEPENDENCY -> DEPENDENT.
-        So 'dep' lines cause edges: each item in expr -> var
-        """
-        G = nx.DiGraph()
-        dep_exprs = {}
-        rev_dep_exprs = {}
-        selects = {}
-        config_types = {}
-
-        print(f"[Debug] Starting to build dependency graph")
-
-        def parse_kconfig_line(line):
-            if line.strip():
-                try:
-                    instr, data = line.strip().split(" ", 1)
-                    return instr, data
-                except ValueError:
-                    return None, None
-            return None, None
-
-        def parse_dependency_expr(expr):
-            configs = set()
-            expr = expr.strip('()')
-            for term in expr.split(' and '):
-                term = term.strip()
-                if ' or ' in term:
-                    or_terms = term.strip('()').split(' or ')
-                    for or_term in or_terms:
-                        if or_term.startswith('CONFIG_'):
-                            configs.add(or_term)
-                elif term.startswith('not '):
-                    term = term.replace('not ', '').strip('()')
-                    if term.startswith('CONFIG_'):
-                        configs.add(term)
-                elif term.startswith('CONFIG_'):
-                    configs.add(term)
-            return list(configs)
-
-        print("Parsing kconfig data...")
-        for line in content.split('\n'):
-            instr, data = parse_kconfig_line(line)
-            if not instr:
-                continue
-
-            if instr == "config":
-                var, type_name = data.split(" ", 1)
-                config_types[var] = type_name
-                G.add_node(var, type=type_name)
-
-            elif instr == "dep":
-                # e.g. 'dep CONFIG_DE2104X (CONFIG_NETDEVICES and ... )'
-                try:
-                    var, expr = data.split(" ", 1)
-                    dep_exprs[var] = expr
-                    deps = parse_dependency_expr(expr)
-                    # We store: each 'dep' is a prerequisite for 'var', so dep -> var
-                    for dep in deps:
-                        G.add_node(var)
-                        G.add_node(dep)
-                        G.add_edge(dep, var, type='depends')
-                except Exception as e:
-                    print(f"Error processing dep line: {data}")
-                    print(f"Error: {e}")
-
-            elif instr == "select":
-                # e.g. 'select CONFIG_X CONFIG_Y (expr)'
-                try:
-                    selected_var, selecting_var, expr = data.split(" ", 2)
-                    if selected_var not in selects:
-                        selects[selected_var] = {}
-                    if selecting_var not in selects[selected_var]:
-                        selects[selected_var][selecting_var] = set()
-                    selects[selected_var][selecting_var].add(expr)
-
-                    G.add_node(selecting_var)
-                    G.add_node(selected_var)
-                    # For 'select', interpret "selecting_var -> selected_var" as
-                    # "selected_var is a prerequisite to selecting_var" or the reverse.
-                    # Typically we do "selected_var -> selecting_var" if 'select' means:
-                    #   "If selecting_var is on, it forcibly sets selected_var."
-                    # Then selected_var is effectively a 'dependency' if it can't be turned on.
-                    #
-                    # But many treat "select" as "selecting_var depends on selected_var".
-                    # For consistency with 'dep', do 'selected_var -> selecting_var' (i.e. "if X is not possible, Y cannot select it").
-                    # However, if you prefer the opposite, be consistent throughout.
-                    # Let's do the same direction as 'dep': dependency -> dependent.
-                    #
-                    # So: "CONFIG_X is forced on by CONFIG_Y" => "X is a needed item, Y can't be valid if X can't be turned on"
-                    # so X -> Y
-                    G.add_edge(selecting_var, selected_var, type='selects')
-                except Exception as e:
-                    print(f"Error processing select line: {data}")
-                    print(f"Error: {e}")
-
-            elif instr == "rev_dep":
-                # e.g. "rev_dep CONFIG_ISA_BUS_API (CONFIG_GPIO_104_DIO_48E and ... )"
-                try:
-                    var, expr = data.split(" ", 1)
-                    rev_dep_exprs[var] = expr
-                    deps = parse_dependency_expr(expr)
-                    # "rev_dep" is typically a reversed approach: "these 'deps' forcibly rely on var."
-                    # If we want the same direction "dependency -> dependent",
-                    # then the 'dependency' is 'var', the 'dependent' is each item in 'deps'.
-                    # So we do: var -> dep
-                    for dep in deps:
-                        G.add_node(var)
-                        G.add_node(dep)
-                        G.add_edge(var, dep, type='reverse_depends')
-                except Exception as e:
-                    print(f"Error processing rev_dep line: {data}")
-                    print(f"Error: {e}")
-
-        print(f"[Debug] Built dependency graph with {G.number_of_nodes()} nodes and {G.number_of_edges()} edges")
-
-        # Print a small number of 'select' edges
-        select_edges = [(u, v) for u, v, d in G.edges(data=True) if d.get('type') == 'selects']
-        print(f"Total 'select' edges found: {len(select_edges)}")
-        print("Printing up to 10 'select' edges:\n")
-        for i, (u, v) in enumerate(select_edges[:10]):
-            print(f"{i + 1}. {u} -> {v} (type: 'selects')")
-
-        return G
-
-    def analyze_kconfig_graph(self, G):
-        """Analyze the Kconfig dependency graph"""
-        print("\nDependency Graph Analysis:")
-        print(f"Total nodes: {G.number_of_nodes()}")
-        print(f"Total edges: {G.number_of_edges()}")
-
-        edge_types = {}
-        for _, _, data in G.edges(data=True):
-            edge_type = data.get('type', 'unknown')
-            edge_types[edge_type] = edge_types.get(edge_type, 0) + 1
-
-        print("\nEdge types:")
-        for edge_type, count in edge_types.items():
-            print(f"  {edge_type}: {count}")
-
-        in_degrees = sorted(G.in_degree(), key=lambda x: x[1], reverse=True)
-        print("\nMost depended-upon configs:")
-        for node, degree in in_degrees[:10]:
-            print(f"  {node}: {degree} incoming edges")
-
-        out_degrees = sorted(G.out_degree(), key=lambda x: x[1], reverse=True)
-        print("\nConfigs with most dependencies:")
-        for node, degree in out_degrees[:10]:
-            print(f"  {node}: {degree} outgoing edges")
-
-    def process_kconfig_dependencies(self, kextract_content):
-        """Process Kconfig dependencies and generate analysis"""
-        print("Building dependency graph...")
-        self.dependency_graph = self.build_kconfig_dependency_graph(kextract_content)  # Store in self
-        print(f"[Debug] Stored dependency graph with {self.dependency_graph.number_of_nodes()} nodes")
-
-        print("\nAnalyzing graph...")
-        self.analyze_kconfig_graph(self.dependency_graph)  # Use stored graph
-
-        return self.dependency_graph  # Can still return if needed
 
     def is_arch_specific_unit(self, unit: str, target_arch: str, accept_x86: bool = True) -> bool:
         """
         Check if a unit is architecture-specific and doesn't match target architecture
         Returns True if unit should be skipped (not compatible with target_arch)
-
-        Parameters:
-            unit: The compilation unit path
-            target_arch: The target architecture (e.g., "x86_64")
-            accept_x86: Whether to also accept "x86" as compatible with "x86_64"
         """
         if unit.startswith("arch/"):
             # Get architecture from subdirectory
@@ -423,8 +252,7 @@ class krepairDC:
             return s
 
         def collect_tokens_for_decl(line: str):
-            pattern = r"\b(CONFIG_[A-Z0-9_]+)\b"
-            found_tokens = re.findall(pattern, line)
+            found_tokens = self.DECL_PATTERN.findall(line)
             return list(set(found_tokens))  # Remove duplicates
 
         def parse_and_store_expression(expr_str: str, current_unit: str):
@@ -605,93 +433,11 @@ class krepairDC:
         for c in self.patch_constraints:
             print(c)
 
-    def remove_unbootable_options(self, unbootable_file_path: str):
-        """
-        Remove unbootable configs from patch data structures.
-        BUT only remove those options that *select* these unbootable configs
-        (i.e. traverse only 'selects' edges). This way, an unbootable config
-        won't get re-enabled by anything that tries to select it.
-        """
-
-        # 1) Read unbootable from file
-        unbootable_options = set()
-        with open(unbootable_file_path, 'r') as f:
-            for line in f:
-                cfg = line.strip()
-                if cfg:
-                    unbootable_options.add(cfg)
-
-        to_remove = set()
-
-        # 2) For each unbootable config, do BFS over 'selects' edges
-        for ub_cfg in unbootable_options:
-            to_remove.add(ub_cfg)
-            if ub_cfg not in self.dependency_graph.nodes:
-                continue
-
-            queue = [ub_cfg]
-            visited = {ub_cfg}
-
-            while queue:
-                current = queue.pop()
-                for succ in self.dependency_graph.successors(current):
-                    edge_data = self.dependency_graph.get_edge_data(current, succ)
-                    e_type = edge_data.get('type', None)
-                    # ONLY follow 'selects' edges here
-                    if e_type == 'selects' and succ not in visited:
-                        visited.add(succ)
-                        queue.append(succ)
-                        to_remove.add(succ)
-
-        print("\n[Debug] Removing the following unbootable options + their selectors:")
-        for cfg in sorted(to_remove):
-            print(f"  {cfg}")
-
-        # 3) Filter out references to these options in self.patch_constraints
-        new_patch_constraints = []
-        for c_expr in self.patch_constraints:
-            c_str = str(c_expr)
-            # If expression does NOT contain any unbootable config, keep it
-            if not any(r in c_str for r in to_remove):
-                new_patch_constraints.append(c_expr)
-
-        self.patch_constraints = new_patch_constraints
-        # Rebuild the seen set so it stays in sync
-        self.patch_constraints_seen = set(new_patch_constraints)
-
-        # 4) Filter from each unit in unit_constraints and unit_configs
-        for unit in list(self.unit_constraints.keys()):
-            old_constraints = self.unit_constraints[unit]
-            new_constraints = []
-            for c_expr in old_constraints:
-                if not any(r in str(c_expr) for r in to_remove):
-                    new_constraints.append(c_expr)
-            self.unit_constraints[unit] = new_constraints
-
-            old_unit_configs = self.unit_configs[unit]
-            new_unit_configs = {cfg for cfg in old_unit_configs if cfg not in to_remove}
-            self.unit_configs[unit] = new_unit_configs
-
-        print("\n[Debug] Finished removing unbootable options (via 'selects' edges only).")
-        print(f"  Unbootable configs from file: {unbootable_options}")
-        print(f"  Total removed (including 'selectors'): {len(to_remove)}")
-        print("  Updated self.patch_constraints, self.unit_constraints, self.unit_configs accordingly.")
-
     def check_constraints_until_unsat_parallel(self, num_processes=24):
         """
         Main function that performs parallel SMT-based satisfiability checks on
         self.patch_constraints, grouping by compilation unit and merging results.
         """
-
-        def get_sorted_units():
-            """
-            Gather and sort compilation units by their number of constraints.
-
-            :returns: List of (unit_name, constraints_list) sorted descending by list length.
-            """
-            units = list(self.unit_constraints.items())
-            units.sort(key=lambda x: len(x[1]), reverse=True)
-            return units
 
         def gather_unique_constraints(units):
             """
@@ -871,7 +617,6 @@ class krepairDC:
             filtered = [i for i in all_valid_indexes if i <= max_valid_index]
             self.patch_constraints = [self.patch_constraints[i] for i in filtered]
 
-
         def finalize_results(valid_by_chunk, never_sat, all_temp_unsat):
             """
             Update self.patch_constraints with final valid constraints and print a summary.
@@ -960,7 +705,7 @@ class krepairDC:
         # build an SMT2 snippet that declares the union of all tokens (group tokens and candidate tokens)
         # and then asserts the candidate constraint.
         def parse_candidate_constraint(constraint, group_declared_tokens):
-            candidate_tokens = set(re.findall(r"(CONFIG_[A-Z0-9_]+)", constraint))
+            candidate_tokens = set(self.DECL_PATTERN.findall(constraint))
             all_tokens = group_declared_tokens.union(candidate_tokens)
             decl_lines = "\n".join(f"(declare-const {t} Bool)" for t in all_tokens)
             full_script = f"(set-logic QF_UF)\n{decl_lines}\n{constraint}"
@@ -1066,9 +811,8 @@ class krepairDC:
 
         # 1. Extract all CONFIG_* symbols from the constraints.
         config_ids = set()
-        config_pattern = r"(CONFIG_[A-Z0-9_]+)"
         for ct in constraints:
-            config_ids.update(re.findall(config_pattern, ct))
+            config_ids.update(self.DECL_PATTERN.findall(ct))
 
         # 2. Gather user patch declarations (if available) and determine which CONFIG_* are already declared.
         declared_ids = set()
@@ -1104,7 +848,7 @@ class krepairDC:
         for idx, ct in enumerate(constraints):
             inner = strip_outer_assert(ct)
             # Extract CONFIG_* options from the inner expression.
-            config_options = re.findall(config_pattern, inner)
+            config_options = self.DECL_PATTERN.findall(inner)
             constraint_config_map[f"a{idx}"] = config_options
             # Assert the implication using the assumption a{idx}.
             script_lines.append(f"(assert (=> a{idx} {inner}))")
@@ -1211,7 +955,6 @@ class krepairDC:
         the combined constraints remain satisfiable. The loop stops when an
         iteration produces no successful merges.
         """
-        # TODO: split function
 
         tried_chunks = defaultdict(set)
 
@@ -1268,7 +1011,7 @@ class krepairDC:
         print(f"Remaining Chunks: {final_chunks}")
         return valid_by_chunk
 
-    def generate_repaired_configs(self, output_dir: str):
+    def generate_repaired_configs(self, output_dir: str, arch_name: str):
         """
         Generates repaired Linux kernel configuration files for each constraint group
         and saves them to the specified output directory.
@@ -1324,7 +1067,7 @@ class krepairDC:
                 # Extract all CONFIG variables from constraints
                 config_vars = set()
                 for constraint in constraints:
-                    matches = re.findall(r'CONFIG_[A-Za-z0-9_]+', constraint)
+                    matches = self.DECL_PATTERN.findall(constraint)
                     config_vars.update(matches)
 
                 # Build SMT script with declarations for all variables
@@ -1333,7 +1076,6 @@ class krepairDC:
                     smt_script += f"(declare-const {var} Bool)\n"
 
                 # We'll parse the constraints in separate groups to maintain order
-
                 arch_constraints = list(self.arch_baseline_solver.assertions())
 
                 # Parse the patch constraints
@@ -1409,7 +1151,7 @@ class krepairDC:
                     config_options = [l for l in config_lines if l.startswith('CONFIG_')]
                     print(f"[DEBUG] Total CONFIG options to write: {len(config_options)}")
 
-                    config_filename = os.path.join(output_dir, f"repaired_config_{group_id}.config")
+                    config_filename = os.path.join(output_dir, f"{group_id}-{arch_name}.config")
                     with open(config_filename, "w") as f:
                         f.write(config_text)
                     print(f"[SUCCESS] Generated repaired config: {config_filename}")
@@ -1533,9 +1275,8 @@ def process_complete_smt_script(
 def main():
     # Tester/prototyping function
 
-    linux_ksrc = "/home/alexei/LinuxKernels/krepair_alg/pre-study-fixes/cleanup/linux_300commitset_copy_post_all_changes"
+    linux_ksrc = "/home/alexei/LinuxKernels/krepair_alg/pre-study-fixes/cleanup/linux_set50copy_koverage"
     existing_config_file = f"{linux_ksrc}/.config"
-    unbootable_options_file = "/home/alexei/LinuxKernels/krepair_alg/linux_set50copy/unbootable_options.txt"
     output_dir = f"{linux_ksrc}"
 
     krepair = krepairDC(linux_ksrc, existing_config_path=existing_config_file)
@@ -1550,14 +1291,12 @@ def main():
     with open(f"{linux_ksrc}/x86_64_formulas.pkl/kextract", "r") as f:
         content = f.read()
 
-    krepair.process_kconfig_dependencies(content)
     krepair.parse_patch_configs_file(f"{linux_ksrc}/patch_constraints.txt")
-    krepair.remove_unbootable_options(unbootable_options_file)
 
     krepair.check_constraints_until_unsat_parallel()
 
     # Generate repaired config files
-    krepair.generate_repaired_configs(output_dir)
+    krepair.generate_repaired_configs(output_dir, "x86_64")
 
     elapsed_time = time.time() - start_time
     print(f"Algorithm 1 completed in {elapsed_time:.2f} seconds")
