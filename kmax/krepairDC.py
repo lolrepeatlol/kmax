@@ -1,8 +1,8 @@
 import time
-from typing import List
 import z3
 import re
 from tqdm import tqdm
+from typing import List, Dict, Tuple
 import os
 import logging
 import subprocess
@@ -183,6 +183,7 @@ class krepairDC:
         Check if a unit is architecture-specific and doesn't match target architecture
         Returns True if unit should be skipped (not compatible with target_arch)
         """
+        # TODO: update with get_archs_from_subdir
         if unit.startswith("arch/"):
             # Get architecture from subdirectory
             unit_arch = unit.split('/')[1]  # Gets the arch name from arch/NAME/...
@@ -432,6 +433,81 @@ class krepairDC:
         print("\n[Debug] Reordered Patch Constraints:")
         for c in self.patch_constraints:
             print(c)
+
+    def get_patch_constraints(
+            self,
+            requirements: List[Tuple[str, List[int]]],
+            kmax_constraints: Dict[str, List],
+            line_constraints: Dict[str, Dict[str, Klocalizer.ConditionalBlock]],
+            accumulated_constraints: List,
+            arch
+    ):
+        """
+        Collect the same constraints as original krepair, and
+        store them in self.patch_constraints/self.unit_constraints.
+
+        Constraints are deduplicated across units.
+
+        requirements: list of (unit, [lines]) tuples
+        kmax_constraints: mapping unit -> list of z3 constraint objects
+        line_constraints: mapping srcfile -> { arch.name: ConditionalBlock }
+        accumulated_constraints: list of z3 constraint objects applied everywhere
+        arch: object with .name attribute (e.g. "x86_64")
+        """
+
+        seen = set()  # track every assertion we’ve already added
+        self.patch_constraints = []
+        self.unit_constraints = defaultdict(list)
+        self.patch_declarations = set()  # <-- reset your declares here
+
+        for unit, lines in requirements:
+            # 1) skip directory‐only units
+            if unit.endswith('/'):
+                continue
+
+            # 2) skip any unit that’s arch‐specific to another arch
+            if self.is_arch_specific_unit(unit, arch.name, accept_x86=True):
+                continue
+
+            # 3) gather all z3 ExprRefs just like original
+            srcfile = Klocalizer.unit2srcfile(unit)
+            combined = list(kmax_constraints.get(unit, []))
+
+            cb_map = line_constraints.get(srcfile, {})
+            cb = cb_map.get(arch.name)
+            if cb is not None:
+                for line in lines:
+                    if line == 0:
+                        continue
+                    deepest = cb.get_deepest_block(line)
+                    if deepest:
+                        combined.extend(deepest.pc.assertions())
+
+            combined.extend(accumulated_constraints)
+
+            # 4) for each constraint, serialize, declare all tokens, then dedup & store
+            for c in combined:
+                try:
+                    sexpr = c.sexpr()
+                except Exception as e:
+                    logger.warning(f"Failed to serialize constraint for {unit}: {e}")
+                    continue
+
+                # collect tokens and add declare-const lines
+                tokens = set(self.DECL_PATTERN.findall(sexpr))
+                for t in sorted(tokens):
+                    self.patch_declarations.add(f"(declare-const {t} Bool)")
+
+                assertion = f"(assert {sexpr})"
+                if assertion in seen:
+                    continue  # skip duplicates across units
+                seen.add(assertion)
+
+                self.patch_constraints.append(assertion)
+                self.unit_constraints[unit].append(assertion)
+
+        total = sum(len(v) for v in self.unit_constraints.values())
+        logger.info(f"Collected {total} unique patch constraints across {len(self.unit_constraints)} units")
 
     def check_constraints_until_unsat_parallel(self, num_processes=24):
         """
@@ -883,7 +959,7 @@ class krepairDC:
 
         return (cloned_solver.check() == z3.sat)
 
-    def _attempt_merge_chunks(self, valid_by_chunk, first_phase_only=False):
+    def _attempt_merge_chunks(self, valid_by_chunk):
         """
         Attempts to merge satisfiable chunks of patch constraints
         by merging as much as possible (greedily).
@@ -948,7 +1024,7 @@ class krepairDC:
         print(f"Remaining Chunks: {final_chunks}")
         return valid_by_chunk
 
-    def generate_repaired_configs(self, output_dir: str, arch_name: str):
+    def generate_repaired_configs(self, output_dir: str, arch_name: str, approx_constraints_raw=None):
         """
         Generates repaired Linux kernel configuration files for each constraint group
         and saves them to the specified output directory.
@@ -962,7 +1038,7 @@ class krepairDC:
         kernel configuration is generated from the model and saved to the output
         directory.
         """
-        # TODO: break function into smaller parts & simplify
+        # TODO: look into using _test_chunk_satisfiability() here instead?
 
         def _to_arch_ctx(exprs):
             """
@@ -987,9 +1063,13 @@ class krepairDC:
         # Check if architecture constraints are present
         assert self.arch_baseline_solver.assertions()
 
-        # Get approximate constraints from existing config
-        approx_constraints_raw = Klocalizer.get_config_file_constraints(self.existing_config_path)
-        print(f"[DEBUG] Loaded {len(approx_constraints_raw)} approximate constraints from config")
+        # Only get approximate constraints if not provided (TODO: remove this)
+        if approx_constraints_raw is None:
+            # Get approximate constraints from existing config
+            approx_constraints_raw = Klocalizer.get_config_file_constraints(self.existing_config_path)
+            print(f"[DEBUG] Loaded {len(approx_constraints_raw)} approximate constraints from config")
+        else:
+            print(f"[DEBUG] Using {len(approx_constraints_raw)} provided approximate constraints")
 
         # Translate constraints to the architecture context
         approx_constraints = _to_arch_ctx(approx_constraints_raw)
@@ -1212,7 +1292,7 @@ def iteratively_test_constraints(
 def main():
     # Tester/prototyping function
 
-    linux_ksrc = "/home/alexei/LinuxKernels/krepair_alg/pre-study-fixes/cleanup/linux_other300commitset_newunsatcore"
+    linux_ksrc = "/home/alexei/LinuxKernels/krepair_alg/integration_testing/linux_copy_original"
     existing_config_file = f"{linux_ksrc}/.config"
     output_dir = f"{linux_ksrc}"
 

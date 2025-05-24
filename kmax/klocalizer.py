@@ -643,6 +643,11 @@ class Klocalizer:
       # Add debug to __approximate_model method
       print(f"Approximating model with {len(self.__approximate_constraints)} constraints")
 
+      # Write the approximate constraints to a file
+      with open("approximate_constraints.txt", "w") as f:
+        for constraint in assumptions:
+          f.write(str(constraint) + "\n")
+
       is_sat = solver.check(assumptions) == z3.sat
       if is_sat:
         self.__logger.info("Already satisfiable when constraining with given config.  No approximatation needed.\n")
@@ -1550,6 +1555,16 @@ class Klocalizer:
     ret_code = Klocalizer.SourcelinePcResult.SUCCESS
     pc = Klocalizer.ConditionalBlock._ConditionalBlock__parse_cb(literal_eval(superc_pcfile_content))
     return ret_code, arch, pc
+
+  @staticmethod
+  def unit2srcfile(unit) -> str:
+    assert unit.endswith('.c') or unit.endswith('.o')
+    return unit[:-len('.o')] + '.c'
+
+  @staticmethod
+  def srcfile2unit(srcfile) -> str:
+    assert srcfile.endswith('.c') or srcfile.endswith('.o')
+    return srcfile[:-len('.c')] + '.o'
 
   #
   # Exceptions
