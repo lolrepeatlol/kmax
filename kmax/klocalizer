@@ -79,9 +79,9 @@ def klocalizerCLI():
                              "  klocalizer does not fail if some of --include-mutex constraints are not met."
                              "  A coverage report will be generated (see --coverage-report)."
                              "  Input format is the same with --include.")
-  # TODO: better explain difference between classic and krepairDC
-  argparser.add_argument('--mutex-algo', choices=["classic", "krepairDC"], default="classic",
-                         help="Algorithm for mutually exclusive constraints: 'classic' (original greedy algorithm) or 'krepairDC' (divide and conquer-based, experimental)")
+  # TODO: better explain difference between original and krepairDC
+  argparser.add_argument('--mutex-algo', choices=["original", "krepairDC"], default="original",
+                         help="Algorithm for mutually exclusive constraints: 'original' (original greedy algorithm) or 'krepairDC' (divide and conquer-based, experimental)")
   argparser.add_argument('--coverage-report',
                          type=str,
                          default="coverage_report.json",
@@ -1241,6 +1241,7 @@ def klocalizerCLI():
 
       def run_krepairDC():
           """Run krepairDC algorithm to generate repaired configurations."""
+          logger.info("Running krepairDC algorithm...\n")
           krDC = KrepairDC(linux_ksrc, existing_config_path=apprx_config_file_path)  # create instance
           krDC.get_complex_arch_constraints(arch.name) # TODO: replace with a new function that just reads existing kclause file
           krDC.get_patch_constraints(requirements, kmax_constraints, line_constraints, accumulated_constraints, arch)  # get patch constraints
@@ -1258,11 +1259,11 @@ def klocalizerCLI():
       if mutex_algo_choice == "krepairDC":
           run_krepairDC()
           exit(0) # Avoid running the original algorithm if krepairDC is selected
-      elif mutex_algo_choice == "classic":
-          # -- Otherwise, run classic algorithm if selected
+      elif mutex_algo_choice == "original":
+          # -- Otherwise, run original algorithm if selected
           pass
       else:
-          logger.error("Algorithm not selected. Please select either 'krepairDC' or 'classic'.\n")
+          logger.error("Algorithm not selected. Please select either 'krepairDC' or 'original'.\n")
           exit(12)
 
       # TODO: remove this entire section of code
@@ -1911,7 +1912,6 @@ if __name__ == '__main__':
         logger.error("SuperC checks failed, reason: %s.  Either fix the issue or omit the line requirements.\n" % (e.reason))
         exit(1)
     finally:
-        # This block will run even if klocalizerCLI() calls exit()
         if start_time is not None:
             logger.info(f"Total time elapsed for Alg 1: {time.time() - start_time:.2f} seconds\n")
 
