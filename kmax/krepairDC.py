@@ -11,7 +11,6 @@ from functools import partial
 from kmax.arch import Arch
 from kmax.klocalizer import Klocalizer
 import multiprocessing as mp
-mp.set_start_method("fork", force=True)
 from collections import defaultdict, Counter
 from concurrent.futures import as_completed, ProcessPoolExecutor
 
