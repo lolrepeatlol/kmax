@@ -135,6 +135,6 @@ class FileChangeType(enum.Enum):
             # both before and after instead of none_file name. See
             # e8bf1f522aee3b3e1e7658e8f224dca1d88c3338 for the Linux kernel.
             return FileChangeType.REMOVED
-        elif "new file mode" or "new mode" in diff.text:
+        elif "new file mode" in diff.text or "new mode" in diff.text:
             return FileChangeType.PERMISSION_CHANGED
         else: assert False # all cases are covered above
