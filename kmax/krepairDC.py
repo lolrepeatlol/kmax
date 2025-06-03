@@ -55,7 +55,8 @@ def process_constraint_batch(batch, start_idx):
     return declarations, assertions
 
 class krepairDC:
-    DECL_PATTERN = re.compile(r"(CONFIG_[A-Z0-9_]+)")  # compile once for efficiency
+    # CONFIG_FOO  |  BITS=32 / BITS=64  |  anything already pipe-quoted
+    DECL_PATTERN = re.compile(r"(?:CONFIG_[A-Za-z0-9_]+|BITS=[0-9]+|\|[^|]+\|)")
 
     def __init__(self, linux_ksrc: str, existing_config_path: str):
         self.linux_ksrc = linux_ksrc  # Path to the Linux kernel source directory
@@ -769,6 +770,7 @@ class krepairDC:
         - If still unsat, mark as never_sat.
         - If sat, make a new group containing just that constraint.
         """
+        # TODO: break into multiple functions
         never_sat = set()
 
         # Combine all temp_unsat constraints into a unique list.
@@ -863,16 +865,20 @@ class krepairDC:
         Return { 'a<i>': [CONFIG_…] } for the constraints that
         participate in the unsat core, or None if the whole set is sat/unknown.
         """
+
+        # TODO: look into skipping re-declaration pass (could cause edge cases)
         # 1. Collect CONFIG_* symbols we might need to declare
         all_cfg_ids = {cfg for ct in constraints
                        for cfg in self.DECL_PATTERN.findall(ct)}
 
         declared_ids = set()
         if self.patch_declarations:
-            declared_ids = {m.group(1)
-                            for d in self.patch_declarations
-                            for m in [re.match(r"\(declare-const\s+([A-Z0-9_]+)\s+Bool\)", d)]
-                            if m}
+            # Pull every SYMBOL from our existing “(declare-const SYMBOL Bool)” lines:
+            declared_ids = {
+                    tok
+                    for d in self.patch_declarations
+                    for tok in self.DECL_PATTERN.findall(d)
+                }
 
         auto_decl_text = "\n".join(f"(declare-const {cfg} Bool)"
                                    for cfg in sorted(all_cfg_ids - declared_ids))
@@ -1039,6 +1045,7 @@ class krepairDC:
         directory.
         """
         # TODO: look into using _test_chunk_satisfiability() here instead?
+        # TODO: clean up
 
         def _to_arch_ctx(exprs):
             """
