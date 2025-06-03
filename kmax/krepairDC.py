@@ -479,7 +479,7 @@ class krepairDC:
                 for constraint in never_sat:
                     print(f"  - {constraint.strip()}")
 
-
+        # Distribute constraints for parallel processing
         units = list(self.unit_constraints.items())
         unique_constraints = gather_unique_constraints(units)
         num_chunks = determine_num_chunks(len(unique_constraints), num_processes)
@@ -489,7 +489,7 @@ class krepairDC:
         scripts = build_smt_scripts(chunks)  # Build SMT scripts for each chunk
         filtered_chunks, results_by_index, all_temp_unsat = execute_parallel(scripts, chunks, global_indexes)  # Test constraints in groups
 
-        # Collect and update the always‑sat constraints
+        # Collect and update the SAT constraints
         all_valid = collect_valid_indexes(results_by_index)
         update_patch_constraints(all_valid)
         print(f"Successfully processed {len(self.patch_constraints)} constraints")
@@ -502,7 +502,7 @@ class krepairDC:
         never_sat = self._process_temp_unsat(all_temp_unsat, valid_by_chunk)
         finalize_results(valid_by_chunk, never_sat, all_temp_unsat)
 
-        # Single‐shot merge: run both Phase 1 & Phase 2
+        # Merge all chunks as much as possible
         valid_by_chunk = self._attempt_merge_chunks(valid_by_chunk)
 
         # Assemble and write out final constraints
