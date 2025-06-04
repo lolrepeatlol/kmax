@@ -840,10 +840,26 @@ class krepairDC:
         approx_constraints = _to_arch_ctx(approx_constraints_raw)
         print(f"[DEBUG] Converted {len(approx_constraints)} approximate constraints")
 
-        groups = self.merged_groups if hasattr(self, "merged_groups") and self.merged_groups else {1: self.patch_constraints}
+        # Check if merged_groups is set
+        if not hasattr(self, "merged_groups"):
+            raise RuntimeError("`merged_groups` must be set before calling generate_repaired_configs()")
 
-        for group_id, constraints in sorted(groups.items()):
-            print(f"\n[INFO] Processing constraint group {group_id}...")
+        # Ensure merged_groups is not empty
+        if not self.merged_groups:
+            raise RuntimeError("`merged_groups` is empty—nothing to repair")
+
+        groups = self.merged_groups
+
+        # 1) Sort all (group_id, constraints) pairs by descending size of the constraint list
+        sorted_groups = sorted(
+            groups.items(),
+            key=lambda item: len(item[1]),
+            reverse=True
+        )
+
+        # 2) Enumerate over sorted_groups so that 'i' goes 0..(num_groups-1)
+        for i, (group_id, constraints) in enumerate(sorted_groups):
+            print(f"\n[INFO] Processing constraint group {group_id} (index {i}) with {len(constraints)} constraints...")
 
             try:
                 # Extract all CONFIG variables from constraints
@@ -933,17 +949,19 @@ class krepairDC:
                     config_options = [l for l in config_lines if l.startswith('CONFIG_')]
                     print(f"[DEBUG] Total CONFIG options to write: {len(config_options)}")
 
-                    config_filename = os.path.join(output_dir, f"{group_id}-{arch_name}.config")
+                    # Write out the repaired config using index 'i' instead of group_id
+                    config_filename = os.path.join(output_dir, f"{i}-{arch_name}.config")
                     with open(config_filename, "w") as f:
                         f.write(config_text)
                     print(f"[SUCCESS] Generated repaired config: {config_filename}")
                 else:
-                    print(f"[WARNING] Constraint group {group_id} is UNSAT")
+                    print(f"[WARNING] Constraint group {group_id} (index {i}) is UNSAT")
             except Exception as e:
-                print(f"[ERROR] Failed processing group {group_id}: {str(e)}")
+                print(f"[ERROR] Failed processing group {group_id} (index {i}): {str(e)}")
                 continue
 
         return constraints
+
 
 def iteratively_test_constraints(
         chunk_idx,
@@ -958,7 +976,7 @@ def iteratively_test_constraints(
     Filters a single chunk of patch constraints, keeping only those that remain
     satisfiable when added to the architecture baseline.
 
-    For the given ``chunk_idx`` the function builds a fresh Z3 solver, loads
+    For the given chunk_idx the function builds a fresh Z3 solver, loads
     architecture-wide constraints and patch-level declarations, then pushes each
     constraint one-by-one.  If adding a constraint preserves satisfiability it is
     kept; otherwise it is popped and recorded in temp_unsat.
