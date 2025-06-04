@@ -1054,36 +1054,3 @@ def iteratively_test_constraints(
     except Exception as e:
         print(f"Critical failure in chunk {chunk_id}: {e}")
         return [], [], chunk_id, []
-
-
-def main():
-    # Tester/prototyping function
-
-    linux_ksrc = "/home/alexei/LinuxKernels/krepair_alg/integration_testing/linux_copy_original"
-    existing_config_file = f"{linux_ksrc}/.config"
-    output_dir = f"{linux_ksrc}"
-
-    krepair = krepairDC(linux_ksrc, existing_config_path=existing_config_file)
-
-    # Get arch constraints
-    krepair.get_complex_arch_constraints("x86_64")
-
-    # Start recording amount of time for krepairDC mutex algorithm
-    start_time = time.time()
-
-    # Read kextract output
-    with open(f"{linux_ksrc}/x86_64_formulas.pkl/kextract", "r") as f:
-        content = f.read()
-
-    # krepair.parse_patch_configs_file(f"{linux_ksrc}/patch_constraints.txt")
-
-    krepair.check_constraints_until_unsat_parallel()
-
-    # Generate repaired config files
-    krepair.generate_repaired_configs(output_dir, "x86_64")
-
-    elapsed_time = time.time() - start_time
-    print(f"Algorithm 1 completed in {elapsed_time:.2f} seconds")
-
-if __name__ == "__main__":
-    main()
