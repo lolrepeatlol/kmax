@@ -367,11 +367,9 @@ class krepairDC:
                 futures = {
                     ex.submit(
                         iteratively_test_constraints,
-                        scripts[i],
                         i,
                         indexes_by_chunk[i],
                         chunks[i],
-                        self.patch_constraints,
                         self.arch_smt2_str,
                         shared,
                         self.patch_declarations,
@@ -948,11 +946,9 @@ class krepairDC:
         return constraints
 
 def iteratively_test_constraints(
-        full_script,
         chunk_idx,
         global_indexes,
         local_constraints,
-        all_constraints,
         arch_smt2_str,
         shared_data,
         patch_declarations,
