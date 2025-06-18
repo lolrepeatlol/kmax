@@ -648,8 +648,9 @@ def main():
     os.makedirs(tmp_dir, exist_ok=True)
 
     # Prepare kernel repos
+    copy_cores = min(cores, 8)  # limit copy parallelism to avoid overload
     copied_kernels, skipped_idxs = copy_kernel_multiple_times(
-        kernels_src, tmp_dir, mode, commit_list_file, num_kernels, cores
+        kernels_src, tmp_dir, mode, commit_list_file, num_kernels, copy_cores
     )
 
     # Pre-create result rows for every blank-line skip
