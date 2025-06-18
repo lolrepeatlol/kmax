@@ -9,39 +9,70 @@ import argparse
 import statistics
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Any
 from tqdm import tqdm
 
 # Constants for number of kernels and paths
-VENV_ACTIVATE = os.path.expanduser('/home/alexei/IDEProjects/PyCharmProjects/kmax/venv_new/bin/activate')
+VENV_ACTIVATE = os.path.expanduser('/home/alexei/Miscellaneous/kmax/tester_venv/bin/activate')
 KOVERAGE = 'koverage'  # Assumes koverage is in the virtualenv's path
 
 # Time modes
 TIME_WINDOWS = ['12h', '72h', '7d']
 
 def load_commits(path: str) -> List[str]:
-    with open(path) as f:
-        commits = [ln.strip() for ln in f if ln.strip()]
-    # oldest-to-newest for repeatability
-    commits.reverse()
+    """
+    Return the commit list exactly line-for-line (oldest→newest).
+    Blank / whitespace-only lines become an empty string ''.
+    A warning is printed if any blanks are seen.
+    """
+    commits: List[str] = []
+    blanks = 0
+
+    with open(path, "r") as f:
+        for line in f:
+            sha = line.strip()
+            if not sha:
+                blanks += 1
+            commits.append(sha)          # keep even the blank
+
+    if len(commits) == 0 or len(commits) == blanks:
+        raise RuntimeError(f"No commit SHAs found in {path}")
+
+    if blanks:
+        print(f"[WARN] {blanks} blank lines in {path}")
+
+    commits.reverse()                     # oldest → newest
     print(f"[INFO] Loaded {len(commits)} commits from {path}")
     return commits
 
 def copy_kernel_multiple_times(kernel_src: str,
                                tmp_dir: str,
-                               commits: List[str]
-                               ) -> List[Tuple[int, str]]:
+                               commit_list_file: str,
+                               max_kernels: int
+                               ) -> Tuple[List[Tuple[int, str]], List[int]]:
     """
-    One copy per commit.  Returns [(commit_idx, dst_path), …]
+    Copies the kernel tree once per *non-blank* commit.
+    Returns:
+      copied   – [(idx, dst_path), …]  for real SHAs
+      skipped  – [idx, idx, …]         indices whose SHA was blank
     """
-    copied = []
+    commits = load_commits(commit_list_file)[:max_kernels]
+
+    copied:  List[Tuple[int, str]] = []
+    skipped: List[int] = []
+
     for idx, sha in enumerate(commits):
+        if not sha:                 # blank line → skip, remember the index
+            skipped.append(idx)
+            continue
+
         dst_path = os.path.join(tmp_dir, f"{idx:03d}_{sha[:7]}")
         print(f"[INFO] Copying kernel #{idx} to '{dst_path}'")
         if not os.path.exists(dst_path):
             shutil.copytree(kernel_src, dst_path)
         copied.append((idx, dst_path))
-    return copied
+
+    return copied, skipped
 
 def make_patchset(
         repo: str,
@@ -53,32 +84,27 @@ def make_patchset(
     1) Load 'new' commits from commit_list_file
     2) Load 'old' commits from old_commit_list_file
     3) Pick both by the same index (wrapping around)
-    4) Checkout the 'new' commit
-    5) Count how many commits are between old..new
-    6) Generate a diff patch at repo/patchset_{idx}.diff
-    Returns: (patch_path, commit_count)
+    4) If either is blank, raise RuntimeError("blank line at …")
+    5) Checkout the 'new' commit
+    6) Count how many commits are between old..new
+    7) Generate a diff patch at repo/patchset_{idx}.diff
+    Returns: (patch_path, commit_count, old_commit, new_commit)
     """
     print(f"[JOB {idx}] ▶ make_patchset: repo={repo}")
-    # — Load lists of SHAs
-    with open(commit_list_file, 'r') as f:
-        new_commits = [c.strip() for c in f if c.strip()]
-    if not new_commits:
-        raise RuntimeError(f"No commits in {commit_list_file}")
 
-    with open(old_commit_list_file, 'r') as f:
-        old_commits = [c.strip() for c in f if c.strip()]
-    if not old_commits:
-        raise RuntimeError(f"No commits in {old_commit_list_file}")
+    # — Load lists of SHAs
+    new_commits = load_commits(commit_list_file)
+    old_commits = load_commits(old_commit_list_file)
 
     # — Select by index (wrap if idx >= len)
     selected = new_commits[idx % len(new_commits)]
     reference = old_commits[idx % len(old_commits)]
 
-    # Bail out if the chosen old-commit entry is empty
+    # detect blanks
+    if not selected:
+        raise RuntimeError(f"Blank line in NEW commit list at index {idx}")
     if not reference:
-        raise RuntimeError(
-            f"Empty old-commit entry at line {idx} of {old_commit_list_file}"
-        )
+        raise RuntimeError(f"Blank line in OLD commit list at index {idx}")
 
     # — Checkout the new commit
     subprocess.run(
@@ -463,12 +489,18 @@ def process_kernel(args):
 
     except Exception as e:
         print(f"Error in {repo}: {e}")
-        return None
+        return {
+            'job_index': idx,
+            'mode':      mode,
+            'time_window': time_window,
+            'skip_reason': str(e)[:200]      # truncate long tracebacks
+        }
 
 def write_results_to_csv(results, csv_path):
     """
     Writes a list of result dictionaries to a CSV file.
     Flattens the 'groups' list as JSON and 'size_ratio' tuple as "max,min".
+    Ensures every fieldname is present (filling missing ones with '').
     Skips any None entries.
     """
     fieldnames = [
@@ -485,10 +517,11 @@ def write_results_to_csv(results, csv_path):
         'time_elapsed_seconds',
         'commit_count',
         'config_change_pct',
-        'per_config_pct'
+        'per_config_pct',
+        'skip_reason'          # <-- you’ve added this
     ]
 
-    # Guard: ensure directory exists, even if path is just a filename
+    # Make sure target dir exists
     out_dir = os.path.dirname(csv_path) or "."
     os.makedirs(out_dir, exist_ok=True)
 
@@ -501,14 +534,30 @@ def write_results_to_csv(results, csv_path):
         for result in results:
             if not result:
                 continue
+
+            # 1) Copy so we don’t mutate the original
             row = result.copy()
+
+            # 2) Ensure every column has *something* ('' if unset)
+            for key in fieldnames:
+                row.setdefault(key, '')
+
+            # 3) Flatten the complex fields
             row['groups'] = json.dumps(row['groups'])
-            if row['size_ratio'][0] is not None:
+            if row['size_ratio'] and row['size_ratio'][0] is not None:
                 row['size_ratio'] = f"{row['size_ratio'][0]},{row['size_ratio'][1]}"
             else:
                 row['size_ratio'] = ''
-            row['config_change_pct'] = row.get('config_change_pct')
+
+            # 4) config_change_pct can be None or a float
+            #    leave it as-is (None → blank cell)
+            row['config_change_pct'] = row.get('config_change_pct', '')
+
+            # 5) per_config_pct is a dict → JSON string
             row['per_config_pct'] = json.dumps(row.get('per_config_pct', {}))
+
+            # 6) skip_reason was set by the caller if needed;
+            #    otherwise it’s '', so the column stays blank
             writer.writerow(row)
 
 
@@ -576,9 +625,31 @@ def main():
     os.makedirs(tmp_dir, exist_ok=True)
 
     # Prepare kernel repos
-    commits = load_commits(commit_list_file)
-    commits = commits[:num_kernels]
-    copied_kernels = copy_kernel_multiple_times(kernels_src, tmp_dir, commits)
+    copied_kernels, skipped_idxs = copy_kernel_multiple_times(
+        kernels_src, tmp_dir, commit_list_file, num_kernels
+    )
+
+    # Pre-create result rows for every blank-line skip
+    results: List[Dict[str, Any]] = [
+        {
+            'job_index':            idx,
+            'mode':                 mode,
+            'time_window':          time_window,
+            'old_commit':           '',
+            'current_commit':       '',
+            'coverage':             None,
+            'groups':               [],
+            'total_constraints':    0,
+            'evenness':             0,
+            'size_ratio':           (None, None),
+            'time_elapsed_seconds': None,
+            'commit_count':         None,
+            'config_change_pct':    None,
+            'per_config_pct':       {},
+            'skip_reason':          'blank line in commit list'
+        }
+        for idx in skipped_idxs
+    ]
 
     # Build a list of jobs: (kernel_dir, time_window, job_index, mode, ...) for each kernel
     jobs = [
@@ -594,7 +665,7 @@ def main():
     # Process the jobs in parallel
     with ProcessPoolExecutor(max_workers=cores) as executor:
         futures = [executor.submit(process_kernel, job) for job in jobs]
-    results = []
+
     for fut in tqdm(as_completed(futures),
                     total=len(futures),
                     desc=f"[{mode}] jobs",
@@ -607,7 +678,7 @@ def main():
     write_results_to_csv(results, output_csv)
 
     # Output the result summary
-    success_count = sum(bool(r) for r in results if r is not None)
+    success_count = sum(1 for r in results if not r.get('skip_reason'))
     print(f"Done ({args.time_window}, {mode}). {success_count} runs succeeded.")
 
 if __name__ == '__main__':
