@@ -74,6 +74,12 @@ def make_patchset(
     selected = new_commits[idx % len(new_commits)]
     reference = old_commits[idx % len(old_commits)]
 
+    # Bail out if the chosen old-commit entry is empty
+    if not reference:
+        raise RuntimeError(
+            f"Empty old-commit entry at line {idx} of {old_commit_list_file}"
+        )
+
     # — Checkout the new commit
     subprocess.run(
         ['git', 'checkout', '-f', selected],
