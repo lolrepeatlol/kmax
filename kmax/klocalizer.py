@@ -20,6 +20,8 @@ from kmax.arch import Arch
 from kmax.common import get_kmax_constraints, unpickle_kmax_file
 from kmax.vcommon import getLogLevel, getLogger, run
 from kmax.kclause import tristate_pattern
+import csv
+import json
 
 builtin_rewrite_mapping = {
   "drivers/gpu/drm/amd/": "drivers/gpu/drm/amd/amdgpu/../",
@@ -603,9 +605,9 @@ class Klocalizer:
       # keep this to remember if sat check is done or not
       self.__is_sat = None
 
-      print(f"Z3ModelSampler configuration:")
-      print(f"  random_seed: {random_seed}")
-      print(f"  approximate_constraints: {len(self.__approximate_constraints) if self.__approximate_constraints else 'None'}")
+      #print(f"Z3ModelSampler configuration:")
+      #print(f"  random_seed: {random_seed}")
+      #print(f"  approximate_constraints: {len(self.__approximate_constraints) if self.__approximate_constraints else 'None'}")
     
     def set_logger(self, logger):
       """Set logger.
@@ -642,11 +644,6 @@ class Klocalizer:
 
       # Add debug to __approximate_model method
       print(f"Approximating model with {len(self.__approximate_constraints)} constraints")
-
-      # Write the approximate constraints to a file
-      with open("approximate_constraints.txt", "w") as f:
-        for constraint in assumptions:
-          f.write(str(constraint) + "\n")
 
       is_sat = solver.check(assumptions) == z3.sat
       if is_sat:
@@ -1565,6 +1562,34 @@ class Klocalizer:
   def srcfile2unit(srcfile) -> str:
     assert srcfile.endswith('.c') or srcfile.endswith('.o')
     return srcfile[:-len('.c')] + '.o'
+
+  @staticmethod
+  def write_alg1_summary_csv(csv_path, group_sizes, total_deduped_all, start_time):
+    """
+    Write out a single‐row CSV containing:
+      - num_groups: how many krepair runs you did
+      - total_deduped_all: global unique constraint count
+      - time_elapsed_seconds: wall-clock time since start_time
+      - group_sizes: JSON-encoded list of per-group unique counts
+    """
+    elapsed = time.time() - start_time
+    num_groups = len(group_sizes)
+
+    with open(csv_path, "w", newline="") as csvfile:
+      fieldnames = [
+        "num_groups",
+        "total_deduped_all",
+        "time_elapsed_seconds",
+        "group_sizes",
+      ]
+      writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+      writer.writeheader()
+      writer.writerow({
+        "num_groups":           num_groups,
+        "total_deduped_all":    total_deduped_all,
+        "time_elapsed_seconds": f"{elapsed:.2f}",
+        "group_sizes":          json.dumps(group_sizes),
+      })
 
   #
   # Exceptions

@@ -38,6 +38,7 @@ class BasicLogger:
 def klocalizerCLI():
   klocalizer=Klocalizer()
 
+  # Track time for Algorithm 1
   global start_time
   start_time = 0.0
 
@@ -79,7 +80,7 @@ def klocalizerCLI():
                              "  klocalizer does not fail if some of --include-mutex constraints are not met."
                              "  A coverage report will be generated (see --coverage-report)."
                              "  Input format is the same with --include.")
-  # TODO: better explain difference between original and krepairDC
+  # TODO: more thoroughly explain difference between original and krepairDC
   argparser.add_argument('--mutex-algo', choices=["original", "krepairDC"], default="original",
                          help="Algorithm for mutually exclusive constraints: 'original' (original greedy algorithm) or 'krepairDC' (divide and conquer-based, experimental)")
   argparser.add_argument('--coverage-report',
@@ -1142,15 +1143,21 @@ def klocalizerCLI():
     # Save the covering improving z3 models, from which config files will be sampled.
     z3_models = [] # (arch, z3_model, [(unit:line)]) tuples
 
+    # Track configuration files and their constraints
+    krepair_increment = -1  # Tracks number of generated configuration files
+    group_sizes = []  # Tracks the number of deduplicated constraints added to each configuration file
+
+    total_constraint_count = 0  # Tracks the total number of deduplicated constraints added to all configuration files
+    overall_seen = set()  # Holds all constraints across all configuration files for tracking deduplication
+
     # The architecture is only updated if the coverage is no longer improved
     # by the current architecture. This means, we can do several iterations
     # on the same architecture to account for mutually exclusive configurations.
     arch_idx = 0
-    increment = 0
     printed_arch_info = False
     got_first_improvement = False
     while arch_idx < len(archs) and requirements:
-      increment += 1
+      krepair_increment += 1
       # Assign the architecture to work with.
       arch = archs[arch_idx]
 
@@ -1243,17 +1250,31 @@ def klocalizerCLI():
           """Run krepairDC algorithm to generate repaired configurations."""
           logger.info("Running krepairDC algorithm...\n")
           krDC = KrepairDC(linux_ksrc, existing_config_path=apprx_config_file_path)  # create instance
-          krDC.get_complex_arch_constraints(arch.name) # TODO: replace with a new function that just reads existing kclause file
-          krDC.get_patch_constraints(requirements, kmax_constraints, line_constraints, accumulated_constraints, arch)  # get patch constraints
+          krDC.get_complex_arch_constraints(arch.name)  # TODO: replace with a new function that just reads existing kclause file
+          krDC.get_patch_constraints(requirements, kmax_constraints, line_constraints, arch)  # get patch constraints
 
           # start recording time for alg 1
           global start_time
           start_time = time.time()
 
-          krDC.check_constraints_until_unsat_parallel()  # apply algorithm
+          # apply algorithm
+          group_sizes, total_deduped_all = krDC.check_constraints_until_unsat_parallel()
 
+          # repair configuration files
           apprx_constraints = approximate_constraints.get(arch.name, approximate_constraints.get("default", None))  # get the .config constraints
           krDC.generate_repaired_configs(output_dir, arch.name, approx_constraints_raw=apprx_constraints)  # create repaired configuration files
+
+          # Log the total time elapsed for the algorithm
+          logger.info(f"Total time elapsed for krepairDC: {time.time() - start_time:.2f} seconds\n")
+
+          # write algorithm summary csv
+          Klocalizer.write_alg1_summary_csv(
+              csv_path="krepairDC_summary.csv",
+              group_sizes=group_sizes,
+              total_deduped_all=total_deduped_all,
+              start_time=start_time
+          )
+          logger.info("Wrote krepairDC summary to krepairDC_summary.csv\n")
 
       # -- Run krepairDC if selected
       if mutex_algo_choice == "krepairDC":
@@ -1266,63 +1287,53 @@ def klocalizerCLI():
           logger.error("Algorithm not selected. Please select either 'krepairDC' or 'original'.\n")
           exit(12)
 
-      # TODO: remove this entire section of code
+      # TODO: consider removing this entire section of code
       logger.info("Writing constraints for patchset...\n")
-      constraints_file = "patch_constraints.txt"
+      constraints_file = "patch_constraints.json"
 
-      # Check if file already exists
-      should_write_constraints = True
+      # Skip if we’ve already written it
       if os.path.exists(constraints_file):
         logger.info("Constraints file already exists, skipping write...\n")
-        should_write_constraints = False
+      else:
+        # If file doesn't exist, proceed with constraint collection and writing
+        file_constraints = {}
+        for unit, lines in requirements:
+          srcfile = Klocalizer.unit2srcfile(unit)
+          logger.debug(f"Checking constraints for {unit} -> {srcfile}\n")
+          logger.debug(f"Available architectures: {list(line_constraints[srcfile].keys())}\n")
 
-      # If file doesn't exist, proceed with constraint collection and writing
-      if should_write_constraints:
-          file_constraints = {}
-          for unit, lines in requirements:
-            srcfile = Klocalizer.unit2srcfile(unit)
-            logger.debug(f"Checking constraints for {unit} -> {srcfile}\n")
-            logger.debug(f"Available architectures: {list(line_constraints[srcfile].keys())}\n")
-            if not unit.endswith('/'):
-                srcfile = Klocalizer.unit2srcfile(unit)
-                file_constraints[unit] = []  # List to maintain order and structure
+          if not unit.endswith('/'):
+            file_constraints.setdefault(unit, [])
 
-                # Get Makefile constraints
-                if unit in kmax_constraints and kmax_constraints[unit]:
-                    file_constraints[unit].extend(kmax_constraints[unit])
+            # Get Makefile constraints
+            if unit in kmax_constraints and kmax_constraints[unit]:
+              file_constraints[unit].extend(kmax_constraints[unit])
 
-                # Get line presence conditions
-                if arch.name in line_constraints[srcfile]:
-                    cb = line_constraints[srcfile][arch.name]
-                    if cb is not None:
-                        for line in lines:
-                            if line != 0:
-                                deepest_block = cb.get_deepest_block(line)
-                                if deepest_block:
-                                    file_constraints[unit].extend(deepest_block.pc.assertions())
+            # Get line presence conditions
+            if arch.name in line_constraints[srcfile]:
+              cb = line_constraints[srcfile][arch.name]
+              if cb is not None:
+                for line in lines:
+                  if line != 0:
+                    deepest_block = cb.get_deepest_block(line)
+                    if deepest_block:
+                      file_constraints[unit].extend(deepest_block.pc.assertions())
 
-                # Get accumulated constraints
-                constraints_with_file = accumulated_constraints + kmax_constraints[unit]
-                file_constraints[unit].extend(constraints_with_file)
+            # Accumulated constraints
+            # file_constraints[unit].extend(accumulated_constraints + kmax_constraints.get(unit, []))
 
-          # Write constraints while preserving structure
-          with open(constraints_file, "w") as f:
-            f.write(f"# Constraints collected for arch: {arch.name}\n")
+        # serialize only the raw sexprs
+        serializable = {
+          unit: [c.sexpr() for c in cons]
+          for unit, cons in file_constraints.items()
+        }
 
-            for unit in file_constraints:
-                f.write(f"\n# Unit: {unit}\n")
+        # write JSON
+        with open(constraints_file, "w") as f:
+          json.dump(serializable, f, indent=2)
 
-                for constraint in file_constraints[unit]:
-                    try:
-                        # Convert directly to S-expression format
-                        sexpr = constraint.sexpr()
-                        f.write(f"{sexpr}\n")
-                    except Exception as e:
-                        logger.warning(f"Failed to write constraint for {unit}: {e}\n")
-                        continue
-
-          logger.info("Constraints written for patchset\n")
-          start_time = time.time()
+        logger.info("Constraints written for patchset\n")
+        start_time = time.time()  # Record the start time for the algorithm
 
       # Keep track of whether there is an improvement found to the coverage
       # with the accumulated constraints. If not, loop will continue with
@@ -1500,36 +1511,35 @@ def klocalizerCLI():
         assert accumulated_constraints
         full_constraints = compiled_arch_constraints + accumulated_constraints
 
-        with open("old_krepair_smt.smt2", "w") as f:
-            for constraint in full_constraints:
-                f.write(str(constraint) + "\n")
+        with open("original_krepair_smt.smt2", "w") as f:
+          for constraint in full_constraints:
+            f.write(str(constraint) + "\n")
 
-        print("\n[DEBUG] Old implementation SMT script saved as 'old_krepair_smt.smt2'")
+        logger.debug("SMT script saved as 'old_krepair_smt.smt2'\n")
 
         apprx_constraints = approximate_constraints.get(arch.name, approximate_constraints.get("default", None))
 
-        # Add debugging for the full constraints
-        print(f"[DEBUG] Old implementation - Full constraints count: {len(full_constraints)}")
+        # Debugging for the full constraints
+        logger.debug("Full constraints count: %s\n" % len(full_constraints))
         if full_constraints:
-            print(f"[DEBUG] Old implementation - Full constraints context: {full_constraints[0].ctx}")
+          logger.debug("Full constraints context: %s\n" % full_constraints[0].ctx)
 
         model_sampler = Klocalizer.Z3ModelSampler(full_constraints, approximate_constraints=apprx_constraints, random_seed=random_seed, logger=logger)
         is_sat, z3_model = model_sampler.sample_model()
         assert is_sat
         assert current_coverage
         z3_models.append((arch, z3_model, current_coverage))
-        # Add debug logging
-        print(f"[DEBUG] Model declarations: {len(z3_model.decls())}")
-        print(f"[DEBUG] True assignments: {sum(1 for d in z3_model.decls() if z3_model[d] == True)}")
-        print(f"[DEBUG] CONFIG_ assignments: {sum(1 for d in z3_model.decls() if str(d).startswith('CONFIG_'))}")
+
+        logger.debug("Model declarations: %s\n" % len(z3_model.decls()))
+        logger.debug("True assignments: %s\n" % sum(1 for d in z3_model.decls() if z3_model[d] == True))
+        logger.debug("CONFIG_ assignments: %s\n" % sum(1 for d in z3_model.decls() if str(d).startswith('CONFIG_')))
 
         logger.debug("Sampled a model\n")
 
         # Now, write out only the constraints that are explicitly covered.
-        covered_constraints = {}  # We'll build a dict: { unit : [constraints] }
+        covered_constraints = {}  # { unit : [z3-constraint-objects] }
         for unit, lines in current_coverage.items():
             covered_constraints.setdefault(unit, [])
-            # Add file-level (Makefile) constraints.
             if unit in kmax_constraints and kmax_constraints[unit]:
                 covered_constraints[unit].extend(kmax_constraints[unit])
             # For each covered line, add the corresponding line-specific constraints.
@@ -1542,18 +1552,53 @@ def klocalizerCLI():
                         if deepest_block:
                             covered_constraints[unit].extend(deepest_block.pc.assertions())
 
-        # Write the covered constraints to a file.
-        covered_file = f"covered_patch_constraints_{increment}_idx{arch_idx}.txt"
-        with open(covered_file, "w") as f:
-            f.write(f"# Covered constraints {increment} collected for arch: {arch.name}\n")
-            for unit in covered_constraints:
-                f.write(f"\n# Unit: {unit}\n")
-                for c in covered_constraints[unit]:
-                    try:
-                        f.write(f"{c.sexpr()}\n")
-                    except Exception as e:
-                        logger.warning(f"Failed to write constraint for {unit}: {e}\n")
-        logger.info(f"Covered constraints written to {covered_file}\n")
+        # Convert to JSON-serializable form
+        serializable = {}
+        for unit, constraints in covered_constraints.items():
+            serializable[unit] = []
+            for c in constraints:
+                try:
+                    serializable[unit].append(c.sexpr())
+                except Exception as e:
+                    logger.warning(f"Failed to serialize constraint for {unit}: {e}")
+
+        # Count total vs. unique constraints
+        all_constraints = [
+            sexpr
+            for unit_list in serializable.values()
+            for sexpr in unit_list
+        ]
+
+        total_constraints = len(all_constraints)
+        seen = set(all_constraints)
+        unique_constraints = len(seen)
+
+        # Ensure group_sizes is long enough
+        while len(group_sizes) <= krepair_increment:
+            group_sizes.append(None)
+        group_sizes[krepair_increment] = unique_constraints  # Store the unique constraints count for this increment
+
+        # Update the global set, then compute the global unique count
+        overall_seen.update(all_constraints)
+        total_constraint_count = len(overall_seen)
+
+        # Write the covered constraints to a JSON file
+        json_file = f"covered_patch_constraints_{krepair_increment}_arch_{arch.name}.json"
+        with open(json_file, "w") as f:
+            json.dump({
+                "arch":                arch.name,
+                "krepair_increment":   krepair_increment,
+                "arch_idx":            arch_idx,
+                "total_constraints":   total_constraints,
+                "unique_constraints":  unique_constraints,
+                "group_sizes":         group_sizes,
+                "constraints":         serializable
+            }, f, indent=2)
+        logger.info(
+            f"Covered constraints written to {json_file}: "
+            f"{total_constraints} total, {unique_constraints} unique (group_sizes: {group_sizes})\n"
+        )
+
       else:
         # Continue with the next architecture as this could not improve coverage anymore.
         arch_idx += 1
@@ -1611,8 +1656,8 @@ def klocalizerCLI():
 
       config_count = 0
       module_count = 0
-      print(f"[DEBUG] Total CONFIG_ declarations found in model: {config_count}")
-      print(f"[DEBUG] Total potential module options: {module_count}")
+      logger.debug("Total CONFIG_ declarations found in model: %s\n" % config_count)
+      logger.debug("Total potential module options: %s\n" % module_count)
 
       # Add to both implementations before calling get_config_from_model
       tristate_pattern = re.compile(r'CONFIG_(.+)_TRISTATE_(y|m)')
@@ -1625,23 +1670,22 @@ def klocalizerCLI():
             config_setting = matches.group(2)
             tristate_settings[config_name] = config_setting
 
-      print(f"Tristate settings count: {len(tristate_settings)}")
-      print(f"Sample tristate settings: {list(tristate_settings.items())[:5]}")
+      logger.debug("Tristate settings count: %s\n" % len(tristate_settings))
+      logger.debug("Sample tristate settings: %s\n" % (list(tristate_settings.items())[:5],))
 
       config_content = Klocalizer.get_config_from_model(model, arch, set_tristate_m=modules_arg, allow_non_visibles=allow_non_visibles, approximate_config=approximate_config)
-      print(f"[DEBUG] allow_non_visibles={allow_non_visibles} in get_config_from_model")
-      print(f"[DEBUG] set_tristate_m={modules_arg} in get_config_from_model")
+
+      # Debugging: Print the config content
       config_lines = config_content.splitlines()
       y_count = sum(1 for l in config_lines if '=y' in l)
       m_count = sum(1 for l in config_lines if '=m' in l)
-      n_count = sum(1 for l in config_lines if '=n' in l)
-      print(f"[DEBUG] Config breakdown:")
-      print(f"  y (built-in): {y_count}")
-      print(f"  m (module): {m_count}")
-      print(f"  n (not set): {n_count}")
-      print(f"[DEBUG] Total lines to write: {len(config_lines)}")
+      logger.debug("Config breakdown:\n")
+      logger.debug("  y (built-in): %s\n" % y_count)
+      logger.debug("  m (module): %s\n" % m_count)
+      logger.debug("Total lines to write: %s\n" % len(config_lines))
       config_options = [l for l in config_lines if l.startswith('CONFIG_')]
-      print(f"[DEBUG] Total CONFIG options to write: {len(config_options)}")
+      logger.debug("Total active CONFIG options to write: %s\n" % len(config_options))
+
       # Write the config file
       with open(config_file_path, 'w') as f:
         f.write(config_content)
@@ -1697,7 +1741,19 @@ def klocalizerCLI():
     logger.info("Note coverage report is attempted coverage.  Actual coverage may be reduced due to limitations of klocalizer's constraint collection.\n")
     with open(coverage_report_file, 'w') as f:
       json.dump(coverage_report, f, indent=2)
-    
+
+    # Log the total time elapsed for the algorithm
+    logger.info(f"Total time elapsed for Alg 1: {time.time() - start_time:.2f} seconds\n")
+
+    # Dump summary.csv in the current directory
+    Klocalizer.write_alg1_summary_csv(
+        csv_path="krepair_summary.csv",
+        group_sizes=group_sizes,
+        total_deduped_all=total_constraint_count,
+        start_time=start_time
+    )
+    logger.info("Wrote overall summary to krepair_summary.csv\n")
+
     #
     # end of mutual exclusion algorithm
     #
@@ -1911,8 +1967,5 @@ if __name__ == '__main__':
     except SuperC.SuperC_ChecksFailed as e:
         logger.error("SuperC checks failed, reason: %s.  Either fix the issue or omit the line requirements.\n" % (e.reason))
         exit(1)
-    finally:
-        if start_time is not None:
-            logger.info(f"Total time elapsed for Alg 1: {time.time() - start_time:.2f} seconds\n")
 
     exit(0)

@@ -200,7 +200,6 @@ class krepairDC:
             requirements: List[Tuple[str, List[int]]],
             kmax_constraints: Dict[str, List],
             line_constraints: Dict[str, Dict[str, Klocalizer.ConditionalBlock]],
-            accumulated_constraints: List,
             arch
     ):
         """
@@ -212,14 +211,13 @@ class krepairDC:
         requirements: list of (unit, [lines]) tuples
         kmax_constraints: mapping unit -> list of z3 constraint objects
         line_constraints: mapping srcfile -> { arch.name: ConditionalBlock }
-        accumulated_constraints: list of z3 constraint objects applied everywhere
         arch: object with .name attribute (e.g. "x86_64")
         """
 
         seen = set()  # track every assertion we’ve already added
         self.patch_constraints = []
         self.unit_constraints = defaultdict(list)
-        self.patch_declarations = set()  # <-- reset your declares here
+        self.patch_declarations = set()
 
         for unit, lines in requirements:
             # 1) skip directory‐only units
@@ -243,8 +241,6 @@ class krepairDC:
                     deepest = cb.get_deepest_block(line)
                     if deepest:
                         combined.extend(deepest.pc.assertions())
-
-            combined.extend(accumulated_constraints)
 
             # 4) for each constraint, serialize, declare all tokens, then dedup & store
             for c in combined:
@@ -305,15 +301,15 @@ class krepairDC:
             Evenly split the unique constraints list into num_chunks parts.
             """
             total = len(unique_constraints)
-            base, extra = divmod(total, num_chunks)
+            base, extra = divmod(total, num_chunks)  # return the quotient and remainder of dividing a by b
             chunks, indexes_by_chunk = [], []
             idx = 0
-            for i in range(num_chunks):
-                size = base + 1 if i < extra else base
-                chunk = unique_constraints[idx:idx+size]
-                chunks.append(chunk)
+            for i in range(num_chunks):  # distribute through all chunks
+                size = base + 1 if i < extra else base  # make the amount of constraints in this chunk at least base, distribute first remainder constraints into first chunks
+                chunk = unique_constraints[idx:idx+size]  # get unique_constraints from idx to idx+size
+                chunks.append(chunk)  # add to all chunks
                 indexes_by_chunk.append(list(range(idx, idx+size)))
-                idx += size
+                idx += size  # increment constraint index by size of previous group
 
             print(f"Final chunk sizes: {[len(chunk) for chunk in chunks]}")
             for i, idxs in enumerate(indexes_by_chunk):
@@ -431,19 +427,6 @@ class krepairDC:
                 final.extend(valid_by_chunk[cid])
             return final
 
-        def write_final_chunks(valid_by_chunk):
-            """
-            Log final groups and write each to a .smt2 file.
-            """
-            print("\n--- Final Grouped Constraints ---")
-            for cid, cons in sorted(valid_by_chunk.items()):
-                print(f"\nChunk {cid}: {len(cons)} constraints")
-                for c in cons[:5]:
-                    print(f"  - {c.strip()}")
-                fname = f"final_chunk_{cid}.smt2"
-                with open(fname, "w") as f:
-                    f.write("\n".join(cons))
-
         def update_patch_constraints(all_valid_indexes):
             """
             Filter self.patch_constraints to keep only those at valid indexes.
@@ -476,6 +459,19 @@ class krepairDC:
                 for constraint in never_sat:
                     print(f"  - {constraint.strip()}")
 
+        def write_final_chunks(valid_by_chunk):
+            """
+            Log final groups and write each to a .smt2 file.
+            """
+            print("\n--- Final Grouped Constraints ---")
+            for cid, cons in sorted(valid_by_chunk.items()):
+                print(f"\nChunk {cid}: {len(cons)} constraints")
+                for c in cons[:5]:
+                    print(f"  - {c.strip()}")
+                fname = f"final_chunk_{cid}.smt2"
+                with open(fname, "w") as f:
+                    f.write("\n".join(cons))
+
         # Distribute constraints for parallel processing
         units = list(self.unit_constraints.items())
         unique_constraints = gather_unique_constraints(units)
@@ -507,14 +503,13 @@ class krepairDC:
         print(f"Final constraints count after merging: {len(self.patch_constraints)}")
         write_final_chunks(valid_by_chunk)
 
-        # Save & return
+        # Update merged_groups with the final valid_by_chunk
         self.merged_groups = valid_by_chunk
-        return {
-            "added_constraints": len(self.patch_constraints),
-            "temp_unsat": all_temp_unsat,
-            "never_sat": never_sat
-        }
 
+        # Write sizes for constraints and return
+        group_sizes = [len(valid_by_chunk[cid]) for cid in sorted(valid_by_chunk)]
+        total_deduped_all = sum(group_sizes)
+        return group_sizes, total_deduped_all
 
     def _process_temp_unsat(self, all_temp_unsat, valid_by_chunk):
         """
@@ -530,12 +525,6 @@ class krepairDC:
         """
         # TODO: break into multiple functions
         never_sat = set()
-
-        # Combine all temp_unsat constraints into a unique list.
-        combined_temp_unsat = set()
-        for constraints in all_temp_unsat.values():
-            combined_temp_unsat.update(constraints)
-        combined_temp_unsat = list(combined_temp_unsat)
 
         # Helper: Given a candidate constraint and the set of tokens already declared for the group,
         # build an SMT2 snippet that declares the union of all tokens (group tokens and candidate tokens)
@@ -565,55 +554,64 @@ class krepairDC:
         # Try groups in increasing-size order
         sorted_group_ids = sorted(valid_by_chunk.keys(), key=lambda cid: len(valid_by_chunk[cid]))
 
-        for constraint in list(combined_temp_unsat):
-            print(f"\nTrying to place constraint: {constraint.strip()}")
-            placed = False
+        # iterate over temp_unsat
+        for src_gid, constraint_list in all_temp_unsat.items():
+            for constraint in list(constraint_list):
+                print(f"\nTrying to place constraint from group {src_gid}: {constraint.strip()}")
+                placed = False
 
-            # 1) Try to fit into any existing group
-            for group_id in sorted_group_ids:
-                solver = solvers[group_id]
-                print(f" Processing group {group_id} (size {len(valid_by_chunk[group_id])})")
-                solver.push()
-                exprs, candidate_tokens = parse_candidate_constraint(constraint, solver_declared_tokens[group_id])
-                solver.add(*exprs)
-                if solver.check() == z3.sat:
-                    solver.pop()
-                    # permanently add to this group
-                    exprs, candidate_tokens = parse_candidate_constraint(constraint, solver_declared_tokens[group_id])
+                for dest_gid in sorted_group_ids:  # still in size order
+                    if dest_gid == src_gid:  # skip its own group
+                        continue
+
+                    solver = solvers[dest_gid]
+                    print(f" Processing group {dest_gid} (size {len(valid_by_chunk[dest_gid])})")
+                    solver.push()
+                    exprs, cand_tokens = parse_candidate_constraint(
+                        constraint, solver_declared_tokens[dest_gid]
+                    )
                     solver.add(*exprs)
-                    solver_declared_tokens[group_id].update(candidate_tokens)
-                    valid_by_chunk[group_id].append(constraint)
-                    combined_temp_unsat.remove(constraint)
-                    print(f"  ✓ Added to group {group_id}")
-                    placed = True
-                    break
-                else:
-                    solver.pop()
-                    print(f"  × Rejected by group {group_id}")
 
-            # 2) If it didn't fit anywhere, try it on its own
-            if not placed:
-                print(f" Trying to place on its own")
-                # build a fresh solver with only arch constraints
-                solo_solver = z3.Solver(ctx=self.arch_baseline_solver.ctx)
-                solo_solver.append(*self.arch_baseline_solver.assertions())
-                exprs, tokens = parse_candidate_constraint(constraint, set())
-                solo_solver.add(*exprs)
+                    if solver.check() == z3.sat:
+                        solver.pop()
+                        # permanently add to this group
+                        exprs, cand_tokens = parse_candidate_constraint(
+                            constraint, solver_declared_tokens[dest_gid]
+                        )
+                        solver.add(*exprs)
+                        solver_declared_tokens[dest_gid].update(cand_tokens)
+                        valid_by_chunk[dest_gid].append(constraint)
+                        constraint_list.remove(constraint)
+                        print(f"  ✓ Added to group {dest_gid}")
+                        placed = True
+                        break
+                    else:
+                        solver.pop()
+                        print(f"  × Rejected by group {dest_gid}")
 
-                if solo_solver.check() == z3.sat:
-                    # create a new group for this single constraint
-                    new_group_id = max(valid_by_chunk.keys(), default=-1) + 1
-                    valid_by_chunk[new_group_id] = [constraint]
-                    solvers[new_group_id] = solo_solver
-                    solver_declared_tokens[new_group_id] = tokens
-                    combined_temp_unsat.remove(constraint)
-                    # re-sort groups so future constraints see the new group
-                    sorted_group_ids = sorted(valid_by_chunk.keys(), key=lambda cid: len(valid_by_chunk[cid]))
-                    print(f"  + Created new group {new_group_id} for constraint")
-                else:
-                    never_sat.add(constraint)
-                    combined_temp_unsat.remove(constraint)
-                    print(f"  → Marked as never_sat: {constraint.strip()}")
+                # If it didn't fit anywhere, try it on its own
+                if not placed:
+                    print(f" Trying to place on its own")
+                    solo_solver = z3.Solver(ctx=self.arch_baseline_solver.ctx)
+                    solo_solver.append(*self.arch_baseline_solver.assertions())
+                    exprs, tokens = parse_candidate_constraint(constraint, set())
+                    solo_solver.add(*exprs)
+
+                    if solo_solver.check() == z3.sat:
+                        new_gid = max(valid_by_chunk, default=-1) + 1
+                        valid_by_chunk[new_gid] = [constraint]
+                        solvers[new_gid] = solo_solver
+                        solver_declared_tokens[new_gid] = tokens
+                        constraint_list.remove(constraint)
+                        sorted_group_ids = sorted(
+                            valid_by_chunk,
+                            key=lambda cid: len(valid_by_chunk[cid])
+                        )
+                        print(f"  + Created new group {new_gid} for constraint")
+                    else:
+                        never_sat.add(constraint)
+                        constraint_list.remove(constraint)
+                        print(f"  → Marked as never_sat: {constraint.strip()}")
 
         print(f"\nDEBUG: Final never_sat constraints count: {len(never_sat)}")
         return never_sat
