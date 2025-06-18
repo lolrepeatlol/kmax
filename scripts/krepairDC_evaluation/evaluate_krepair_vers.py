@@ -47,32 +47,55 @@ def load_commits(path: str) -> List[str]:
 
 def copy_kernel_multiple_times(kernel_src: str,
                                tmp_dir: str,
+                               mode: str,
                                commit_list_file: str,
-                               max_kernels: int
+                               max_kernels: int,
+                               cores: int
                                ) -> Tuple[List[Tuple[int, str]], List[int]]:
     """
-    Copies the kernel tree once per *non-blank* commit.
+    Parallel-copy the kernel tree once per *non-blank* commit, placing each copy
+    under tmp_dir/<mode>/, using up to `cores` workers.
     Returns:
-      copied   – [(idx, dst_path), …]  for real SHAs
-      skipped  – [idx, idx, …]         indices whose SHA was blank
+      copied   – [(idx, dst_path), …]  sorted by idx
+      skipped  – [idx, idx, …]         for blank-line entries
     """
+    dest_root = os.path.join(tmp_dir, mode)
+    os.makedirs(dest_root, exist_ok=True)
+
     commits = load_commits(commit_list_file)[:max_kernels]
 
-    copied:  List[Tuple[int, str]] = []
+    tasks: List[Tuple[int,str,str]] = []
     skipped: List[int] = []
-
     for idx, sha in enumerate(commits):
-        if not sha:                 # blank line → skip, remember the index
+        if not sha:
             skipped.append(idx)
-            continue
+        else:
+            dst = os.path.join(dest_root, f"{idx:03d}_{sha[:7]}")
+            tasks.append((idx, sha, dst))
 
-        dst_path = os.path.join(tmp_dir, f"{idx:03d}_{sha[:7]}")
-        print(f"[INFO] Copying kernel #{idx} to '{dst_path}'")
-        if not os.path.exists(dst_path):
-            shutil.copytree(kernel_src, dst_path)
-        copied.append((idx, dst_path))
+    results: List[Tuple[int, str]] = []
+    with ProcessPoolExecutor(max_workers=cores) as execr:
+        # pass kernel_src and each task to the top-level function
+        future_to_idx = {
+            execr.submit(_copy_single_kernel_task, kernel_src, t): t[0]
+            for t in tasks
+        }
+        for fut in as_completed(future_to_idx):
+            results.append(fut.result())
 
-    return copied, skipped
+    results.sort(key=lambda x: x[0])
+    return results, skipped
+
+def _copy_single_kernel_task(kernel_src: str, task: Tuple[int, str, str]) -> Tuple[int, str]:
+    """
+    Top-level helper so it can be pickled.
+    task = (idx, sha, dst_path)
+    """
+    idx, sha, dst_path = task
+    print(f"[INFO] Copying kernel #{idx} to '{dst_path}'")
+    if not os.path.exists(dst_path):
+        shutil.copytree(kernel_src, dst_path)
+    return idx, dst_path
 
 def make_patchset(
         repo: str,
@@ -626,7 +649,7 @@ def main():
 
     # Prepare kernel repos
     copied_kernels, skipped_idxs = copy_kernel_multiple_times(
-        kernels_src, tmp_dir, commit_list_file, num_kernels
+        kernels_src, tmp_dir, mode, commit_list_file, num_kernels, cores
     )
 
     # Pre-create result rows for every blank-line skip
