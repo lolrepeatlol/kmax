@@ -15,44 +15,40 @@ import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
 
-
-# Helper: robust ISO-8601 → datetime parser
-# Git’s “%cI” ends with either “Z” or an explicit ±HH:MM offset.  We normalise
-# the Z-suffix so strptime can consume it.
-def _parse_iso8601(ts: str) -> datetime:
-    if ts.endswith('Z'):
-        ts = ts[:-1] + '+00:00'
-    return datetime.strptime(ts, '%Y-%m-%dT%H:%M:%S%z')
-
-
 def get_commit_at_time(repo_path: Path, base_commit: str, rel_time: timedelta) -> str:
     """
-    Given a repo and a commit hash, find the most recent ancestor commit
-    that is at least `rel_time` older than the base commit’s author date.
-    If none qualify, return the original commit hash.
+    Find ancestor commit that is at least rel_time older, following mainline only.
     """
-    # Date of the base commit
+    # Get the date/time of the base commit
     date_str = subprocess.check_output(
         ['git', 'show', '-s', '--format=%cI', base_commit],
         cwd=repo_path, text=True
     ).strip()
-    base_date = _parse_iso8601(date_str)
+    base_date = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
     target_date = base_date - rel_time
 
-    # Let Git stop at the first ancestor that satisfies the cutoff
-    cutoff = target_date.strftime('%Y-%m-%dT%H:%M:%S%z')
-    chosen = subprocess.check_output(
-        ['git', 'rev-list', '-n1', '--before', cutoff, base_commit],
+    # Walk MAINLINE ancestors only with --first-parent
+    log = subprocess.check_output(
+        ['git', 'log', '--first-parent', '--pretty=%H %cI', base_commit],
         cwd=repo_path, text=True
-    ).strip()
+    )
 
-    return chosen or base_commit   # rev-list prints nothing if none qualify
+    chosen = None
+    for line in log.splitlines():
+        sha, commit_date_str = line.split(' ', 1)
+        commit_date = datetime.fromisoformat(commit_date_str.replace('Z', '+00:00'))
+        if commit_date <= target_date:
+            chosen = sha
+            break
 
+    return chosen or base_commit
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Generate a list of ancestor commits a given timeframe behind each listed commit."
     )
+    parser.add_argument('-r', '--repo', type=Path, default=Path('.'),
+                        help='Path to the Git repository (default: current directory)')
     parser.add_argument('-i', '--input', type=Path, required=True,
                         help='Text file with one commit hash per line')
     parser.add_argument('-t', '--timeframe', choices=['12h', '72h', '7d'], required=True,
@@ -66,8 +62,11 @@ def main() -> None:
               '7d':  timedelta(days=7)}
     rel_time = tf_map[args.timeframe]
 
-    if not (Path('.') / '.git').exists():
-        parser.error("Current working directory is not a Git repository")
+    repo = args.repo.resolve()
+    if not repo.is_dir():
+        parser.error(f"Path {repo} is not a valid directory")
+    if not (repo / '.git').exists():
+        parser.error(f"Directory {repo} is not a Git repository")
     if not args.input.exists():
         parser.error(f"Input file {args.input} does not exist")
 
@@ -78,7 +77,7 @@ def main() -> None:
     results = []
     for sha in commits:
         try:
-            behind = get_commit_at_time(Path('.'), sha, rel_time)
+            behind = get_commit_at_time(repo, sha, rel_time)
             results.append(behind)
             print(f"{sha} → {behind}")
         except subprocess.CalledProcessError as e:
