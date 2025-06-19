@@ -7,13 +7,14 @@ Usage:
   python generate_commits_by_timeframe.py \
       --input commits.txt \
       --timeframe 12h|72h|7d \
+      --r /path/to/repo \
       [--output behind_commits.txt]
-Assumes you are running inside a git repo.
 """
 import argparse
 import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Tuple
 
 def get_commit_at_time(repo_path: Path, base_commit: str, rel_time: timedelta) -> str:
     """
@@ -42,6 +43,30 @@ def get_commit_at_time(repo_path: Path, base_commit: str, rel_time: timedelta) -
             break
 
     return chosen or base_commit
+
+
+def get_commit_info(repo_path: Path, commit: str) -> Tuple[str, str]:
+    """
+    Get commit date and first line of commit message.
+    """
+    info = subprocess.check_output(
+        ['git', 'show', '-s', '--format=%cI %s', commit],
+        cwd=repo_path, text=True
+    ).strip()
+    date_str, subject = info.split(' ', 1)
+    return date_str, subject
+
+
+def count_mainline_commits(repo_path: Path, start: str, end: str) -> int:
+    """
+    Count commits between start and end following mainline only.
+    """
+    count = subprocess.check_output(
+        ['git', 'rev-list', '--count', '--first-parent', f'{start}..{end}'],
+        cwd=repo_path, text=True
+    ).strip()
+    return int(count)
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -75,18 +100,41 @@ def main() -> None:
         parser.error(f"No commits found in {args.input}")
 
     results = []
+    print(f"\n{'='*80}")
+    print(f"Finding commits {args.timeframe} behind (following mainline only)")
+    print(f"{'='*80}\n")
+
     for sha in commits:
         try:
             behind = get_commit_at_time(repo, sha, rel_time)
             results.append(behind)
-            print(f"{sha} → {behind}")
+
+            # Get info for both commits
+            end_date, end_subject = get_commit_info(repo, sha)
+            start_date, start_subject = get_commit_info(repo, behind)
+
+            # Count mainline commits between them
+            if behind != sha:
+                mainline_count = count_mainline_commits(repo, behind, sha)
+            else:
+                mainline_count = 0
+
+            # Pretty print the results
+            print(f"Original: {sha[:12]} ({end_date})")
+            print(f"          {end_subject[:70]}")
+            print(f"↓")
+            print(f"Behind:   {behind[:12]} ({start_date})")
+            print(f"          {start_subject[:70]}")
+            print(f"")
+            print(f"Mainline commits between: {mainline_count}")
+            print(f"{'-'*80}\n")
+
         except subprocess.CalledProcessError as e:
             print(f"Error processing {sha}: {e}")
             results.append('')
 
     args.output.write_text('\n'.join(results) + '\n')
     print(f"Wrote {len(results)} commits to {args.output}")
-
 
 if __name__ == '__main__':
     main()
