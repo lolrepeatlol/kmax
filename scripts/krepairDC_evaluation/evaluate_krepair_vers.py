@@ -12,12 +12,8 @@ from pathlib import Path
 from typing import List, Tuple, Dict, Any
 from tqdm import tqdm
 
-# Constants for number of kernels and paths
+# Constants
 VENV_ACTIVATE = os.path.expanduser('/home/alexei/Miscellaneous/kmax/tester_venv/bin/activate')
-KOVERAGE = 'koverage'  # Assumes koverage is in the virtualenv's path
-
-# Time modes
-TIME_WINDOWS = ['12h', '72h', '7d']
 
 def load_commits(path: str) -> List[str]:
     """
@@ -48,10 +44,11 @@ def load_commits(path: str) -> List[str]:
 def copy_kernel_multiple_times(kernel_src: str,
                                tmp_dir: str,
                                mode: str,
+                               old_commit_list_file: str,
                                commit_list_file: str,
                                max_kernels: int,
                                cores: int
-                               ) -> Tuple[List[Tuple[int, str]], List[int]]:
+                               ) -> Tuple[List[Tuple[int, str, str, str]], List[int]]:
     """
     Parallel-copy the kernel tree once per *non-blank* commit, placing each copy
     under tmp_dir/<mode>/, using up to `cores` workers.
@@ -63,17 +60,18 @@ def copy_kernel_multiple_times(kernel_src: str,
     os.makedirs(dest_root, exist_ok=True)
 
     commits = load_commits(commit_list_file)[:max_kernels]
+    old_commits = load_commits(old_commit_list_file)[:max_kernels]
 
-    tasks: List[Tuple[int,str,str]] = []
+    tasks: List[Tuple[int,str,str,str]] = []
     skipped: List[int] = []
-    for idx, sha in enumerate(commits):
-        if not sha:
+    for idx, (new_sha, old_sha) in enumerate(zip(commits, old_commits)):
+        if not new_sha or not old_sha:
             skipped.append(idx)
         else:
-            dst = os.path.join(dest_root, f"{idx:03d}_{sha[:7]}")
-            tasks.append((idx, sha, dst))
+            dst = os.path.join(dest_root, f"{idx:03d}_{new_sha[:7]}")
+            tasks.append((idx, new_sha, old_sha, dst))
 
-    results: List[Tuple[int, str]] = []
+    results: List[Tuple[int, str, str, str]] = []
     with ProcessPoolExecutor(max_workers=cores) as execr:
         # pass kernel_src and each task to the top-level function
         future_to_idx = {
@@ -86,60 +84,48 @@ def copy_kernel_multiple_times(kernel_src: str,
     results.sort(key=lambda x: x[0])
     return results, skipped
 
-def _copy_single_kernel_task(kernel_src: str, task: Tuple[int, str, str]) -> Tuple[int, str]:
+def _copy_single_kernel_task(kernel_src: str,
+                             task: Tuple[int, str, str, str]
+                             ) -> Tuple[int, str, str, str]:
+    idx, new_sha, old_sha, dst_path = task
     """
     Top-level helper so it can be pickled.
     task = (idx, sha, dst_path)
     """
-    idx, sha, dst_path = task
     print(f"[INFO] Copying kernel #{idx} to '{dst_path}'")
     if not os.path.exists(dst_path):
         shutil.copytree(kernel_src, dst_path)
-    return idx, dst_path
+    return idx, dst_path, old_sha, new_sha
 
 def make_patchset(
         repo: str,
         idx: int,
-        commit_list_file: str,
-        old_commit_list_file: str
+        old_sha: str,
+        new_sha: str
 ) -> Tuple[Path, int, str, str]:
     """
-    1) Load 'new' commits from commit_list_file
-    2) Load 'old' commits from old_commit_list_file
-    3) Pick both by the same index (wrapping around)
-    4) If either is blank, raise RuntimeError("blank line at …")
-    5) Checkout the 'new' commit
-    6) Count how many commits are between old..new
-    7) Generate a diff patch at repo/patchset_{idx}.diff
-    Returns: (patch_path, commit_count, old_commit, new_commit)
+    Given an `old_sha` and `new_sha`, checkout `new_sha` in `repo`,
+    count commits in old..new, and `git diff old..new` → patchset_{idx}.diff.
+    Returns (patch_path, commit_count, old_sha, new_sha).
     """
     print(f"[JOB {idx}] ▶ make_patchset: repo={repo}")
 
-    # — Load lists of SHAs
-    new_commits = load_commits(commit_list_file)
-    old_commits = load_commits(old_commit_list_file)
-
-    # — Select by index (wrap if idx >= len)
-    selected = new_commits[idx % len(new_commits)]
-    reference = old_commits[idx % len(old_commits)]
-
     # detect blanks
-    if not selected:
+    if not new_sha:
         raise RuntimeError(f"Blank line in NEW commit list at index {idx}")
-    if not reference:
+    if not old_sha:
         raise RuntimeError(f"Blank line in OLD commit list at index {idx}")
 
     # — Checkout the new commit
     subprocess.run(
-        ['git', 'checkout', '-f', selected],
+        ['git', 'checkout', '-f', new_sha],
         cwd=repo, check=True
     )
 
-    # — Count how many commits are in the range old..new
+    # — Count commits in old_sha..new_sha
     cnt = subprocess.check_output(
-        ['git', 'rev-list', '--count', f'{reference}..{selected}'],
-        cwd=repo,
-        text=True
+        ['git', 'rev-list', '--count', '--first-parent', f'{old_sha}..{new_sha}'],
+        cwd=repo, text=True
     ).strip()
     commit_count = int(cnt)
 
@@ -147,19 +133,23 @@ def make_patchset(
     patch_path = Path(repo) / f'patchset_{idx}.diff'
     with open(patch_path, 'w') as outf:
         subprocess.run(
-            ['git', 'diff', f'{reference}..{selected}'],
+            ['git', 'diff', f'{old_sha}..{new_sha}'],
             cwd=repo, stdout=outf, check=True
         )
 
-    print(f"[JOB {idx}] ✓ patchset: {reference} → {selected} ({commit_count} commits), patch at {patch_path}")
+    print(f"[JOB {idx}] ✓ patchset: {old_sha} → {new_sha} ({commit_count} commits), patch at {patch_path}")
 
-    return patch_path, commit_count, reference, selected
+    return patch_path, commit_count, old_sha, new_sha
 
 def run_krepair(repo, patch_path, mode, idx):
     """Runs klocalizer in the specified repair mode on the given repo."""
     print(f"[JOB {idx}] ▶ run_krepair: mode={mode}, repo={repo}")
 
-    subprocess.run(['make', 'defconfig'], cwd=repo, check=True)
+    defconfig_log = Path(repo) / 'defconfig_make.log'
+    # regenerate .config
+    with open(defconfig_log, "w") as logf:
+        subprocess.run(['make', 'defconfig'], cwd=repo, check=True, stdout=logf, stderr=subprocess.STDOUT)
+
     config_path = Path(repo) / '.config'
     output_file = Path(repo) / f'output_{mode}.txt'
     algo = 'original' if mode == 'original' else 'krepairDC'
@@ -197,7 +187,7 @@ def run_olddefconfig_and_koverage(repo, patch_path, idx):
         out_json = config.replace('.config', '_coverage_results.json')
         out_log = config.replace('.config', '_koverage.log')
         cmd = (
-            f"source {VENV_ACTIVATE} && {KOVERAGE} -f --config \"{config}\" "
+            f"source {VENV_ACTIVATE} && koverage -f --config \"{config}\" "
             f"--arch x86_64 --check-patch {patch_path} -o \"{out_json}\""
         )
         with open(Path(repo) / out_log, "w") as logf:
@@ -223,7 +213,7 @@ def run_defconfig_and_koverage(repo, patch_path, idx):
     # run koverage against the single .config
     cmd = (
         f"source {VENV_ACTIVATE} && "
-        f"{KOVERAGE} -f --config {config_file} "
+        f"koverage -f --config {config_file} "
         f"--arch x86_64 --check-patch {patch_path} -o {out_json}"
     )
     with open(koverage_log, "w") as logf:
@@ -236,6 +226,13 @@ def compute_patch_coverage(repo, idx):
     then runs patch_coverage.py on the merged output. Returns the coverage ratio.
     Logs stdout/stderr of each step to its own log file, and saves the ratio to the patch coverage log.
     """
+    # Get the absolute path to this script's directory
+    script_dir = Path(__file__).resolve().parent
+
+    # Build absolute paths to the scripts
+    total_coverage_path = (script_dir / '../krepair_evaluation/paper/total_coverage.py').resolve()
+    patch_coverage_path = (script_dir / '../krepair_evaluation/paper/patch_coverage.py').resolve()
+
     print(f"[JOB {idx}] ▶ compute_patch_coverage in {repo}")
     # Collect all coverage result JSON files
     coverage_files = [str(p) for p in Path(repo).glob('*_coverage_results.json')]
@@ -243,7 +240,7 @@ def compute_patch_coverage(repo, idx):
         print(f"No coverage result files found in {repo}")
         return None
 
-    total_cov_path = Path(repo) / 'total_coverage_results.json'
+    total_cov_json = Path(repo) / 'total_coverage_results.json'
     total_cov_log  = Path(repo) / 'total_coverage.log'
     patch_cov_log  = Path(repo) / 'patch_coverage.log'
 
@@ -252,8 +249,8 @@ def compute_patch_coverage(repo, idx):
         subprocess.run(
             [
                 'python3',
-                '../krepair_evaluation/paper/total_coverage.py',
-                '-o', str(total_cov_path)
+                str(total_coverage_path),
+                '-o', str(total_cov_json)
             ] + coverage_files,
             cwd=repo,
             check=True,
@@ -265,8 +262,8 @@ def compute_patch_coverage(repo, idx):
     patch_proc = subprocess.run(
         [
             'python3',
-            '../krepair_evaluation/paper/patch_coverage.py',
-            str(total_cov_path)
+            str(patch_coverage_path),
+            str(total_cov_json)
         ],
         cwd=repo,
         stdout=subprocess.PIPE,
@@ -358,6 +355,10 @@ def compute_config_change_percentage(
     """
     print(f"[JOB {idx}] ▶ compute_config_change_percentage('{original_config}', {len(repaired_configs)} repairs)")
 
+    # get absolute path to script directory and measure_change.py
+    script_dir = Path(__file__).resolve().parent
+    measure_change_path = (script_dir / '../krepair_evaluation/paper/measure_change.py').resolve()
+
     # 1. remove old .config if present
     config_path = Path(repo)/'.config'
     if config_path.exists():
@@ -371,7 +372,7 @@ def compute_config_change_percentage(
     # 3. measure_change.py (hard-coded path)
     cmd = [
         'python3',
-        '../krepair_evaluation/paper/measure_change.py',
+        str(measure_change_path),
         '--original-config', original_config,
         *repaired_configs
     ]
@@ -439,7 +440,7 @@ def process_kernel(args):
     Depending on mode, runs defconfig, krepair, or krepairDC, collects results,
     and returns a dictionary of experiment metrics.
     """
-    repo, time_window, idx, mode, commit_list_file, old_commit_list_file = args
+    repo, time_window, idx, mode, old_sha, new_sha = args
 
     # Initialize all result variables with default values
     code_coverage = 0
@@ -457,7 +458,7 @@ def process_kernel(args):
         # 1. Generate the patch between historical and selected commit.
         #    Also get the number of commits in the diff range.
         patch, commit_count, old_commit, current_commit = make_patchset(
-            repo, idx, commit_list_file, old_commit_list_file
+            repo, idx, old_sha, new_sha
         )
 
         # 2. Run the appropriate experiment step
@@ -483,7 +484,7 @@ def process_kernel(args):
 
             # measure how much configs changed under krepair/krepairDC
             repaired_configs = sorted(
-                    str(p) for p in Path(repo).glob('*-repaired.config')
+                    str(p) for p in Path(repo).glob('*-x86_64.config')
                 )
             config_change_pct, per_config_pct = compute_config_change_percentage(
                     repo,
@@ -650,7 +651,7 @@ def main():
     # Prepare kernel repos
     copy_cores = min(cores, 8)  # limit copy parallelism to avoid overload
     copied_kernels, skipped_idxs = copy_kernel_multiple_times(
-        kernels_src, tmp_dir, mode, commit_list_file, num_kernels, copy_cores
+        kernels_src, tmp_dir, mode, old_commit_list_file, commit_list_file, num_kernels, copy_cores
     )
 
     # Pre-create result rows for every blank-line skip
@@ -675,26 +676,25 @@ def main():
         for idx in skipped_idxs
     ]
 
-    # Build a list of jobs: (kernel_dir, time_window, job_index, mode, ...) for each kernel
+    # Build a list of jobs: (kernel_dir, time_window, job_index, mode, old_sha, new_sha) for each kernel
     jobs = [
-        (kernel_dir, time_window, commit_idx, mode,
-         commit_list_file, old_commit_list_file)
-        for commit_idx, kernel_dir in copied_kernels
+        (kernel_dir, time_window, commit_idx, mode, old_sha, new_sha)
+        for (commit_idx, kernel_dir, old_sha, new_sha) in copied_kernels
     ]
 
     print(f"[INFO] Scheduling {len(jobs)} jobs in mode='{mode}'")
-    for commit_idx, kernel_dir in copied_kernels:
+    for commit_idx, kernel_dir, old_sha, new_sha in copied_kernels:
         print(f"[INFO]  • Job {commit_idx}: kernel dir = {kernel_dir}")
 
     # Process the jobs in parallel
     with ProcessPoolExecutor(max_workers=cores) as executor:
-        futures = [executor.submit(process_kernel, job) for job in jobs]
-
-    for fut in tqdm(as_completed(futures),
-                    total=len(futures),
-                    desc=f"[{mode}] jobs",
-                    unit="job"):
-        results.append(fut.result())
+        for result in tqdm(
+                executor.map(process_kernel, jobs),
+                total=len(jobs),
+                desc=f"[{mode}] jobs",
+                unit="job"
+        ):
+            results.append(result)
 
     results.sort(key=lambda r: r['job_index'])  # just in case
 
