@@ -28,7 +28,7 @@ def run(cmd, **kw):
 def ensure_history(repo, need):
     """Make sure <repo> has at least <need> commits reachable from origin/master."""
     for attempt in range(MAX_FETCHES + 1):
-        got = int(run(['git', '-C', repo, 'rev-list', '--count', 'origin/master']))
+        got = int(run(['git', '-C', repo, 'rev-list', '--count', '--first-parent', 'origin/master']))
         if got >= need:
             return
         print(f"[INFO] Only {got} commits; fetching to deepen history…")
@@ -39,7 +39,7 @@ def sample_commits(repo, since, count):
     """Return <count> unique SHAs since <since>."""
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            out = run(['git', '-C', repo, 'log', '--pretty=%H', '--since', since, 'origin/master'])
+            out = run(['git', '-C', repo, 'log', '--first-parent', '--pretty=%H', '--since', since, 'origin/master'])
             shas = out.strip().splitlines()
             if len(shas) < count:
                 raise RuntimeError(f"Found {len(shas)} commits (< {count}); need more history.")
