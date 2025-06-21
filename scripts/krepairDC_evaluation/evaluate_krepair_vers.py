@@ -166,7 +166,7 @@ def run_krepair(repo, patch_path, mode, idx):
 
     config_path = Path(repo) / '.config'
     output_file = Path(repo) / f'output_{mode}.txt'
-    algo = 'original' if mode == 'original' else 'krepairDC'
+    algo = 'original' if mode == 'krepair' else 'krepairDC'
 
     cmd = (
         f"source {VENV_ACTIVATE} && klocalizer --repair {config_path} --arch x86_64 "
@@ -637,8 +637,8 @@ def main():
         help='Time window label for patchset (e.g., 12h, 72h, 7d). Only used for labeling in CSV output.'
     )
     parser.add_argument(
-        '--mode', choices=['original', 'krepairDC', 'defconfig'], default='original',
-        help='Repair mode: original for krepair, krepairDC for krepairDC, defconfig for non-repaired defconfig .config coverage'
+        '--mode', choices=['krepair', 'krepairDC', 'defconfig'], default='krepair',
+        help='Repair mode: krepair for krepair, krepairDC for krepairDC, defconfig for non-repaired defconfig .config coverage'
     )
     parser.add_argument(
         '--output-csv', type=str, default=None,

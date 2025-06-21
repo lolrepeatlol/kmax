@@ -7,7 +7,7 @@ you can delete the kernels themselves afterward.
 
 Directory structure assumed:
     {base_dir}/{mode}/{idx}_{commit}/...
-where mode is one of: defconfig, original, krepairDC.
+where mode is one of: defconfig, krepair, krepairDC.
 
 Usage:
     python3 copy_experiment_outputs.py \
@@ -32,7 +32,7 @@ def gather_patterns(mode):
             'defconfig_coverage_results.json',
             'patch_coverage.log',
         ]
-    else:  # original or krepairDC
+    else:  # krepair or krepairDC
         summary = 'krepairDC_summary.csv' if mode == 'krepairDC' else 'krepair_summary.csv'
         return [
             '*-x86_64.config',
@@ -90,7 +90,7 @@ def main():
     )
     p.add_argument(
         '--mode', '-m',
-        choices=['defconfig', 'original', 'krepairDC'],
+        choices=['defconfig', 'krepair', 'krepairDC'],
         required=True,
         help="Which mode subdirectory to process"
     )
