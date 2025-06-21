@@ -715,14 +715,17 @@ def main():
 
     # Process the jobs in parallel
     with ProcessPoolExecutor(max_workers=cores) as executor:
+        # 1) submit all the jobs
         futures = [executor.submit(process_kernel, job) for job in jobs]
-    for f in tqdm(
-            as_completed(futures),
-            total=len(futures),
-            desc=f"[{mode}] jobs",
-            unit="job",
-    ):
-        results.append(f.result())
+
+        # 2) create a tqdm bar up front
+        with tqdm(total=len(futures),
+                  desc=f"[{mode}] jobs",
+                  unit="job") as pbar:
+            # 3) as each future completes, grab it and advance the bar
+            for future in as_completed(futures):
+                results.append(future.result())
+                pbar.update(1)
 
     results.sort(key=lambda r: r['job_index'])  # just in case
 
