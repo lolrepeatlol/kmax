@@ -465,6 +465,7 @@ def process_kernel(args):
     time_elapsed_seconds = None
     old_commit: str = ''
     current_commit: str = ''
+    commit_count = 0
     config_change_pct = None
     per_config_pct = {}
 
@@ -534,8 +535,11 @@ def process_kernel(args):
         return {
             'job_index': idx,
             'mode':      mode,
+            'old_commit': old_commit,
+            'current_commit': current_commit,
+            'commit_count': commit_count,
             'time_window': time_window,
-            'skip_reason': str(e)[:200]      # truncate long tracebacks
+            'skip_reason': str(e)[:350]      # truncate long tracebacks
         }
 
 def write_results_to_csv(results, csv_path):
