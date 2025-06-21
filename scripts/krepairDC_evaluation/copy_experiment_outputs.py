@@ -20,6 +20,7 @@ import argparse
 import shutil
 from pathlib import Path
 import sys
+from datetime import datetime
 
 def gather_patterns(mode):
     if mode == 'defconfig':
@@ -52,6 +53,10 @@ def copy_for_mode(base_dir: Path, mode: str, output_dir: Path):
         print(f"[ERROR] mode directory not found: {src_root}", file=sys.stderr)
         sys.exit(1)
 
+    # create a timestamped output directory for this run
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    mode_output_dir = output_dir / f"{mode}_{timestamp}"
+
     patterns = gather_patterns(mode)
 
     for sub in sorted(src_root.iterdir()):
@@ -59,7 +64,7 @@ def copy_for_mode(base_dir: Path, mode: str, output_dir: Path):
             continue
 
         rel_name = sub.name  # e.g. "0_ab12cd3"
-        dest_dir = output_dir / mode / rel_name
+        dest_dir = mode_output_dir / rel_name
         dest_dir.mkdir(parents=True, exist_ok=True)
 
         for pat in patterns:
