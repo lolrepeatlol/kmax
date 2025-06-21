@@ -85,7 +85,7 @@ def klocalizerCLI():
                          choices=["original", "krepairDC"],
                          default="original",
                          help="Algorithm for mutually exclusive constraints: 'original' (original greedy algorithm) or 'krepairDC' (divide and conquer-based, experimental)")
-  argparser.add_argument('--num_cores_dc',
+  argparser.add_argument('--num-cores-dc',
                          type=int,
                          default=None,
                          help="Number of cores to use for krepairDC algorithm.  Defaults to ([number of CPU cores] - 2).  If >1, the algorithm will run in parallel using multiprocessing.  Only used with --include-mutex and --mutex-algo=krepairDC.")
