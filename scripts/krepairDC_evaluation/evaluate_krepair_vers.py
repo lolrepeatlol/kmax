@@ -7,12 +7,13 @@ import shutil
 import subprocess
 import argparse
 import statistics
-import functools
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import List, Tuple, Dict, Any
 from tqdm import tqdm
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
 
 # Constants
 VENV_ACTIVATE = os.path.expanduser('/home/alexei/Miscellaneous/kmax/tester_venv/bin/activate')
