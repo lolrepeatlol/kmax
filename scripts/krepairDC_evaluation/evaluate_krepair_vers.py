@@ -20,7 +20,7 @@ VENV_ACTIVATE = os.path.expanduser('/home/alexei/Miscellaneous/kmax/tester_venv/
 
 def load_commits(path: str) -> List[str]:
     """
-    Return the commit list exactly line-for-line (oldest→newest).
+    Return the commit list exactly line-for-line.
     Blank / whitespace-only lines become an empty string ''.
     A warning is printed if any blanks are seen.
     """
@@ -40,7 +40,6 @@ def load_commits(path: str) -> List[str]:
     if blanks:
         print(f"[WARN] {blanks} blank lines in {path}")
 
-    commits.reverse()                     # oldest → newest
     print(f"[INFO] Loaded {len(commits)} commits from {path}")
     return commits
 
