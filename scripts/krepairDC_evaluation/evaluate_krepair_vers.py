@@ -10,7 +10,7 @@ import statistics
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, Optional
 from tqdm import tqdm
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
@@ -348,15 +348,16 @@ def parse_summary_csv(summary_file: str, idx) -> Tuple[List[int], int, float]:
         tqdm.write(f"[JOB {idx}] ✓ parsed: groups={len(group_sizes)}, total={total_constraints}, time={time_elapsed_seconds:.2f}s")
         return group_sizes, total_constraints, time_elapsed_seconds
 
-def compute_group_size_range(values: List[int], idx) -> Tuple[int, int]:
+def compute_group_size_range(values: List[int], idx) -> Tuple[Optional[int], Optional[int]]:
     """
     Returns (largest_group, smallest_group), ignoring zeros.
     If there are no positive values, returns (0, 0).
     """
     tqdm.write(f"[JOB {idx}] ▶ compute_group_size_range on {values}")
     positives = [v for v in values if v > 0]
-    if not positives:
-        return (0, 0)
+    if len(positives) < 2:
+        tqdm.write(f"[JOB {idx}] WARNING: Not enough positive group sizes to compute range.")
+        return (None, None)
     tqdm.write(f"[JOB {idx}] ✓ size range = ({max(positives) if positives else 0}, {min(positives) if positives else 0})")
     return (max(positives), min(positives))
 
@@ -365,7 +366,7 @@ def compute_config_change_percentage(
         original_config: str,
         repaired_configs: List[str],
         idx
-) -> Tuple[float, Dict[str, float]]:
+    ) -> Tuple[float, Dict[str, float]]:
     """
     Returns:
         mean_pct   – float   in [0,1]  (average per-config percentage change)
@@ -398,11 +399,18 @@ def compute_config_change_percentage(
     result = subprocess.run(cmd, cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             text=True, check=True)
     data = json.loads(result.stdout)
+    repaired_raw = data.get('repaired', {})
+    if isinstance(repaired_raw, list):
+        # each entry has a 'configfile' field
+        data['repaired'] = {
+            entry.get('configfile', f"cfg_{i}"): entry
+            for i, entry in enumerate(repaired_raw)
+        }
 
     # 4. sum change_wrt_original (kept for logging / compatibility)
     total_changed = sum(
         entry.get('change_wrt_original', 0)
-        for entry in data.get('repaired', {}).values()
+        for entry in data['repaired'].values()
     )
 
     # 5. count all config options in Kconfig
@@ -421,6 +429,7 @@ def compute_config_change_percentage(
     )
     try:
         total_options = int(opts_res.stdout.strip())
+        tqdm.write(f"[JOB {idx}] total_options = {total_options}")
     except ValueError:
         tqdm.write("[WARNING] Unable to parse total option count.")
         # Also write error to file
@@ -524,13 +533,13 @@ def process_kernel(args):
             'time_window':          time_window,
             'old_commit':           old_commit,
             'current_commit':       current_commit,
+            'commit_count':         commit_count,
             'coverage':             code_coverage,
             'groups':               group_sizes,
             'total_constraints':    total_constraints,
             'evenness':             pielou_j,
             'size_ratio':           size_ratio,
             'time_elapsed_seconds': time_elapsed_seconds,
-            'commit_count':         commit_count,
             'config_change_pct':    config_change_pct,
             'per_config_pct':       per_config_pct
         }
@@ -560,13 +569,13 @@ def write_results_to_csv(results, csv_path):
         'time_window',
         'old_commit',
         'current_commit',
+        'commit_count',
         'coverage',
         'groups',
         'total_constraints',
         'evenness',
         'size_ratio',
         'time_elapsed_seconds',
-        'commit_count',
         'config_change_pct',
         'per_config_pct',
         'skip_reason'
