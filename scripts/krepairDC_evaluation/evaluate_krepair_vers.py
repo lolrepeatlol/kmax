@@ -160,7 +160,7 @@ def run_krepair(repo, patch_path, mode, idx):
     tqdm.write(f"[JOB {idx}] ▶ run_krepair: mode={mode}, repo={repo}")
 
     defconfig_log = Path(repo) / 'defconfig_make.log'
-    # regenerate .config
+    # generate .config
     with open(defconfig_log, "w") as logf:
         subprocess.run(['make', 'defconfig'], cwd=repo, check=True, stdout=logf, stderr=subprocess.STDOUT)
 
@@ -706,13 +706,14 @@ def main():
 
     # Process the jobs in parallel
     with ProcessPoolExecutor(max_workers=cores) as executor:
-        for result in tqdm(
-                executor.map(process_kernel, jobs),
-                total=len(jobs),
-                desc=f"[{mode}] jobs",
-                unit="job"
-        ):
-            results.append(result)
+        futures = [executor.submit(process_kernel, job) for job in jobs]
+    for f in tqdm(
+            as_completed(futures),
+            total=len(futures),
+            desc=f"[{mode}] jobs",
+            unit="job",
+    ):
+        results.append(f.result())
 
     results.sort(key=lambda r: r['job_index'])  # just in case
 
