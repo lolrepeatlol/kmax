@@ -7,6 +7,8 @@ import shutil
 import subprocess
 import argparse
 import statistics
+import functools
+import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import List, Tuple, Dict, Any
@@ -56,6 +58,7 @@ def copy_kernel_multiple_times(kernel_src: str,
       copied   – [(idx, dst_path), …]  sorted by idx
       skipped  – [idx, idx, …]         for blank-line entries
     """
+    print(f"[INFO] Copying kernels from {kernel_src} to {tmp_dir}/{mode} (max {max_kernels} kernels, {cores} cores)")
     dest_root = os.path.join(tmp_dir, mode)
     os.makedirs(dest_root, exist_ok=True)
 
@@ -108,7 +111,7 @@ def make_patchset(
     count commits in old..new, and `git diff old..new` → patchset_{idx}.diff.
     Returns (patch_path, commit_count, old_sha, new_sha).
     """
-    print(f"[JOB {idx}] ▶ make_patchset: repo={repo}")
+    tqdm.write(f"[JOB {idx}] ▶ make_patchset: repo={repo}")
 
     # detect blanks
     if not new_sha:
@@ -116,34 +119,45 @@ def make_patchset(
     if not old_sha:
         raise RuntimeError(f"Blank line in OLD commit list at index {idx}")
 
-    # — Checkout the new commit
-    subprocess.run(
-        ['git', 'checkout', '-f', new_sha],
-        cwd=repo, check=True
-    )
+    log_path = Path(repo) / f'patchset_{idx}.log'
 
-    # — Count commits in old_sha..new_sha
+    # Clean the repo directory
+    with open(log_path, "w") as logf:
+        subprocess.run(
+            ['git', 'clean', '-dfx'],
+            cwd=repo, check=True,
+            stdout=logf, stderr=subprocess.STDOUT
+        )
+
+        # Checkout the new commit
+        subprocess.run(
+            ['git', 'checkout', '-f', new_sha],
+            cwd=repo, check=True,
+            stdout=logf, stderr=subprocess.STDOUT
+        )
+
+    # Count commits in old_sha..new_sha (no need to log; returns directly)
     cnt = subprocess.check_output(
         ['git', 'rev-list', '--count', '--first-parent', f'{old_sha}..{new_sha}'],
         cwd=repo, text=True
     ).strip()
     commit_count = int(cnt)
 
-    # — Generate the patch
+    # Generate the patch, log git diff output (stderr) only
     patch_path = Path(repo) / f'patchset_{idx}.diff'
-    with open(patch_path, 'w') as outf:
+    with open(log_path, "a") as logf, open(patch_path, 'w') as outf:
         subprocess.run(
             ['git', 'diff', f'{old_sha}..{new_sha}'],
-            cwd=repo, stdout=outf, check=True
+            cwd=repo, stdout=outf, stderr=logf, check=True
         )
 
-    print(f"[JOB {idx}] ✓ patchset: {old_sha} → {new_sha} ({commit_count} commits), patch at {patch_path}")
+    tqdm.write(f"[JOB {idx}] ✓ patchset: {old_sha} → {new_sha} ({commit_count} commits), patch at {patch_path}")
 
     return patch_path, commit_count, old_sha, new_sha
 
 def run_krepair(repo, patch_path, mode, idx):
     """Runs klocalizer in the specified repair mode on the given repo."""
-    print(f"[JOB {idx}] ▶ run_krepair: mode={mode}, repo={repo}")
+    tqdm.write(f"[JOB {idx}] ▶ run_krepair: mode={mode}, repo={repo}")
 
     defconfig_log = Path(repo) / 'defconfig_make.log'
     # regenerate .config
@@ -167,12 +181,12 @@ def run_krepair(repo, patch_path, mode, idx):
             executable='/bin/bash', check=True
         )
 
-    print(f"[JOB {idx}] ✓ run_krepair done; output saved to {output_file}")
+    tqdm.write(f"[JOB {idx}] ✓ run_krepair done; output saved to {output_file}")
     return output_file
 
 def run_olddefconfig_and_koverage(repo, patch_path, idx):
     """Runs olddefconfig and koverage for all *-x86_64.config files in repo."""
-    print(f"[JOB {idx}] ▶ olddefconfig + koverage on {repo}")
+    tqdm.write(f"[JOB {idx}] ▶ olddefconfig + koverage on {repo}")
     configs = sorted(str(f) for f in Path(repo).glob('*-x86_64.config'))
 
     # Run olddefconfig for each config
@@ -193,14 +207,14 @@ def run_olddefconfig_and_koverage(repo, patch_path, idx):
         with open(Path(repo) / out_log, "w") as logf:
             subprocess.run(cmd, cwd=repo, shell=True, executable='/bin/bash', check=True, stdout=logf, stderr=subprocess.STDOUT)
 
-    print(f"[JOB {idx}] ✓ olddefconfig+koverage complete")
+    tqdm.write(f"[JOB {idx}] ✓ olddefconfig+koverage complete")
 
 def run_defconfig_and_koverage(repo, patch_path, idx):
     """
     In defconfig mode, just do `make defconfig` and run koverage once
     on the resulting .config, producing a single JSON.
     """
-    print(f"[JOB {idx}] ▶ defconfig+koverage on {repo}")
+    tqdm.write(f"[JOB {idx}] ▶ defconfig+koverage on {repo}")
     defconfig_log = Path(repo) / 'defconfig_make.log'
     # regenerate .config
     with open(defconfig_log, "w") as logf:
@@ -218,7 +232,7 @@ def run_defconfig_and_koverage(repo, patch_path, idx):
     )
     with open(koverage_log, "w") as logf:
         subprocess.run(cmd, cwd=repo, shell=True, executable='/bin/bash', check=True, stdout=logf, stderr=subprocess.STDOUT)
-    print(f"[JOB {idx}] ✓ defconfig+koverage complete")
+    tqdm.write(f"[JOB {idx}] ✓ defconfig+koverage complete")
 
 def compute_patch_coverage(repo, idx):
     """
@@ -233,11 +247,11 @@ def compute_patch_coverage(repo, idx):
     total_coverage_path = (script_dir / '../krepair_evaluation/paper/total_coverage.py').resolve()
     patch_coverage_path = (script_dir / '../krepair_evaluation/paper/patch_coverage.py').resolve()
 
-    print(f"[JOB {idx}] ▶ compute_patch_coverage in {repo}")
+    tqdm.write(f"[JOB {idx}] ▶ compute_patch_coverage in {repo}")
     # Collect all coverage result JSON files
     coverage_files = [str(p) for p in Path(repo).glob('*_coverage_results.json')]
     if not coverage_files:
-        print(f"No coverage result files found in {repo}")
+        tqdm.write(f"No coverage result files found in {repo}")
         return None
 
     total_cov_json = Path(repo) / 'total_coverage_results.json'
@@ -284,7 +298,7 @@ def compute_patch_coverage(repo, idx):
             print(f"patch_coverage_ratio {ratio}", file=logf)
 
     if ratio is not None:
-        print(f"[JOB {idx}] ✓ patch coverage ratio = {ratio}")
+        tqdm.write(f"[JOB {idx}] ✓ patch coverage ratio = {ratio}")
 
     return ratio
 
@@ -293,7 +307,7 @@ def pielou_evenness(values, idx):
     Computes Pielou's evenness index (J) for a list of group sizes.
     Returns a value between 0 (completely uneven) and 1 (perfectly even).
     """
-    print(f"[JOB {idx}] ▶ pielou_evenness on {len(values)} values")
+    tqdm.write(f"[JOB {idx}] ▶ pielou_evenness on {len(values)} values")
     values = [v for v in values if v > 0]  # Ignore zeroes (as is standard)
     n = len(values)
     if n == 0:
@@ -309,7 +323,7 @@ def pielou_evenness(values, idx):
     if n == 1:
         return 1.0  # Perfectly even by definition (only one group)
     pielou_j = entropy / math.log(n)
-    print(f"[JOB {idx}] ✓ evenness = {pielou_j:.4f}")
+    tqdm.write(f"[JOB {idx}] ✓ evenness = {pielou_j:.4f}")
     return pielou_j
 
 def parse_summary_csv(summary_file: str, idx) -> Tuple[List[int], int, float]:
@@ -319,14 +333,14 @@ def parse_summary_csv(summary_file: str, idx) -> Tuple[List[int], int, float]:
       - total_constraints: int (the CSV's `total_deduped_all` column)
       - time_elapsed_seconds: float (the CSV's `time_elapsed_seconds` column)
     """
-    print(f"[JOB {idx}] ▶ parse_summary_csv('{summary_file}')")
+    tqdm.write(f"[JOB {idx}] ▶ parse_summary_csv('{summary_file}')")
     with open(summary_file, newline='') as csvfile:
         reader = csv.DictReader(csvfile)
         row = next(reader)
         group_sizes = json.loads(row['group_sizes'])
         total_constraints = int(row['total_deduped_all'])
         time_elapsed_seconds = float(row['time_elapsed_seconds'])
-        print(f"[JOB {idx}] ✓ parsed: groups={len(group_sizes)}, total={total_constraints}, time={time_elapsed_seconds:.2f}s")
+        tqdm.write(f"[JOB {idx}] ✓ parsed: groups={len(group_sizes)}, total={total_constraints}, time={time_elapsed_seconds:.2f}s")
         return group_sizes, total_constraints, time_elapsed_seconds
 
 def compute_group_size_range(values: List[int], idx) -> Tuple[int, int]:
@@ -334,11 +348,11 @@ def compute_group_size_range(values: List[int], idx) -> Tuple[int, int]:
     Returns (largest_group, smallest_group), ignoring zeros.
     If there are no positive values, returns (0, 0).
     """
-    print(f"[JOB {idx}] ▶ compute_group_size_range on {values}")
+    tqdm.write(f"[JOB {idx}] ▶ compute_group_size_range on {values}")
     positives = [v for v in values if v > 0]
     if not positives:
         return (0, 0)
-    print(f"[JOB {idx}] ✓ size range = ({max(positives) if positives else 0}, {min(positives) if positives else 0})")
+    tqdm.write(f"[JOB {idx}] ✓ size range = ({max(positives) if positives else 0}, {min(positives) if positives else 0})")
     return (max(positives), min(positives))
 
 def compute_config_change_percentage(
@@ -353,7 +367,7 @@ def compute_config_change_percentage(
         per_config – dict[str,float]   {cfg → pct_i}
     Also writes these results to 'config_change_percentage.txt'.
     """
-    print(f"[JOB {idx}] ▶ compute_config_change_percentage('{original_config}', {len(repaired_configs)} repairs)")
+    tqdm.write(f"[JOB {idx}] ▶ compute_config_change_percentage('{original_config}', {len(repaired_configs)} repairs)")
 
     # get absolute path to script directory and measure_change.py
     script_dir = Path(__file__).resolve().parent
@@ -364,7 +378,7 @@ def compute_config_change_percentage(
     if config_path.exists():
         config_path.unlink()
     else:
-        print("[WARNING] .config did not exist before defconfig regeneration.")
+        tqdm.write("[WARNING] .config did not exist before defconfig regeneration.")
 
     # 2. regenerate defconfig
     subprocess.run(['make', 'defconfig'], cwd=repo, check=True)
@@ -403,14 +417,14 @@ def compute_config_change_percentage(
     try:
         total_options = int(opts_res.stdout.strip())
     except ValueError:
-        print("[WARNING] Unable to parse total option count.")
+        tqdm.write("[WARNING] Unable to parse total option count.")
         # Also write error to file
         with open(os.path.join(repo, "config_change_percentage.txt"), "w") as f:
             f.write("ERROR: Unable to parse total option count.\n")
         return -1.0, {}
 
     if total_options <= 0:
-        print("[WARNING] total_options <= 0, returning -1.")
+        tqdm.write("[WARNING] total_options <= 0, returning -1.")
         with open(os.path.join(repo, "config_change_percentage.txt"), "a") as f:
             f.write("ERROR: total_options <= 0\n")
         return -1.0, {}
@@ -423,7 +437,7 @@ def compute_config_change_percentage(
 
     mean_pct = statistics.mean(per_config_pct.values()) if per_config_pct else 0.0
 
-    print(f"[JOB {idx}] ✓ mean_pct = {mean_pct:.4%}, total_changed = {total_changed:.4%}, (configs: {len(per_config_pct)})")
+    tqdm.write(f"[JOB {idx}] ✓ mean_pct = {mean_pct:.4%}, total_changed = {total_changed:.4%}, (configs: {len(per_config_pct)})")
 
     # 7. Write results to config_change_percentage.txt
     with open(os.path.join(repo, "config_change_percentage.txt"), "w") as f:
@@ -453,6 +467,8 @@ def process_kernel(args):
     current_commit: str = ''
     config_change_pct = None
     per_config_pct = {}
+
+    tqdm.write(f"[JOB {idx}] Started processing kernel {repo}")
 
     try:
         # 1. Generate the patch between historical and selected commit.
@@ -493,6 +509,8 @@ def process_kernel(args):
                     idx
                 )
 
+        tqdm.write(f"[JOB {idx}] Finished processing kernel {repo}")
+
         # 5. Return all experiment results as a dictionary
         return {
             'job_index':            idx,
@@ -512,7 +530,7 @@ def process_kernel(args):
         }
 
     except Exception as e:
-        print(f"Error in {repo}: {e}")
+        tqdm.write(f"[JOB {idx}] Error processing kernel {repo}: {e}")
         return {
             'job_index': idx,
             'mode':      mode,
@@ -542,7 +560,7 @@ def write_results_to_csv(results, csv_path):
         'commit_count',
         'config_change_pct',
         'per_config_pct',
-        'skip_reason'          # <-- you’ve added this
+        'skip_reason'
     ]
 
     # Make sure target dir exists
