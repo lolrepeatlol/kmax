@@ -2,7 +2,7 @@ import time
 import z3
 import re
 from tqdm import tqdm
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 import os
 import logging
 import subprocess
@@ -266,7 +266,7 @@ class krepairDC:
         total = sum(len(v) for v in self.unit_constraints.values())
         logger.info(f"Collected {total} unique patch constraints across {len(self.unit_constraints)} units")
 
-    def check_constraints_until_unsat_parallel(self, num_processes=24):
+    def check_constraints_until_unsat_parallel(self, num_processes: int, num_chunks: Optional[int] = 24):
         """
         Main function that performs parallel SMT-based satisfiability checks on
         self.patch_constraints, grouping by compilation unit and merging results.
@@ -285,16 +285,20 @@ class krepairDC:
                         seen.add(c)
             return unique
 
-        def determine_num_chunks(total_unique, num_threads):
+        def determine_num_chunks(total_unique: int, worker_cap: int, override_cap: Optional[int]) -> int:
             """
             Decide how many chunks to split into based on total constraints.
             """
+            # Pick the cap that governs us this run
+            cap = override_cap if override_cap is not None else worker_cap
+            cap = max(cap, 1)  # never zero
+
+            # Apply the heuristic
             if total_unique < 50:
-                return 3
+                return min(3, cap)
             elif total_unique < 1000:
-                return min(12, num_threads)
-            else:
-                return min(num_threads, max(8, total_unique // 100))
+                return min(12, cap)
+            return min(cap, max(8, total_unique // 100))
 
         def distribute_constraints(unique_constraints, num_chunks):
             """
@@ -475,7 +479,7 @@ class krepairDC:
         # Distribute constraints for parallel processing
         units = list(self.unit_constraints.items())
         unique_constraints = gather_unique_constraints(units)
-        num_chunks = determine_num_chunks(len(unique_constraints), num_processes)
+        num_chunks = determine_num_chunks(len(unique_constraints), num_processes, num_chunks)
         print(f"Distributing {len(unique_constraints)} unique constraints into {num_chunks} chunks.")
         chunks, global_indexes = distribute_constraints(unique_constraints, num_chunks)
         detect_duplicates(chunks)  # Sanity check: Duplicates

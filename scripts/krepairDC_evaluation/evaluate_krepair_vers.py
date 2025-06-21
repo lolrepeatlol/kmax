@@ -168,10 +168,15 @@ def run_krepair(repo, patch_path, mode, idx):
     output_file = Path(repo) / f'output_{mode}.txt'
     algo = 'original' if mode == 'krepair' else 'krepairDC'
 
+    # Start building the base command
     cmd = (
         f"source {VENV_ACTIVATE} && klocalizer --repair {config_path} --arch x86_64 "
         f"--include-mutex {patch_path} --mutex-algo {algo} --verbose"
     )
+
+    # Add --num_cores_dc 1 only for krepairDC
+    if mode == 'krepairDC':
+        cmd += " --num_cores_dc 1"
 
     # Capture output to file
     with open(output_file, 'w') as outf:

@@ -81,8 +81,14 @@ def klocalizerCLI():
                              "  A coverage report will be generated (see --coverage-report)."
                              "  Input format is the same with --include.")
   # TODO: more thoroughly explain difference between original and krepairDC
-  argparser.add_argument('--mutex-algo', choices=["original", "krepairDC"], default="original",
+  argparser.add_argument('--mutex-algo',
+                         choices=["original", "krepairDC"],
+                         default="original",
                          help="Algorithm for mutually exclusive constraints: 'original' (original greedy algorithm) or 'krepairDC' (divide and conquer-based, experimental)")
+  argparser.add_argument('--num_cores_dc',
+                         type=int,
+                         default=None,
+                         help="Number of cores to use for krepairDC algorithm.  Defaults to ([number of CPU cores] - 2).  If >1, the algorithm will run in parallel using multiprocessing.  Only used with --include-mutex and --mutex-algo=krepairDC.")
   argparser.add_argument('--coverage-report',
                          type=str,
                          default="coverage_report.json",
@@ -303,6 +309,7 @@ def klocalizerCLI():
   include_arg = args.include
   include_mutex_arg = args.include_mutex
   mutex_algo_choice = args.mutex_algo
+  num_cores_dc = args.num_cores_dc
   exclude_arg = args.exclude
   no_builtin_kbuild_path_rewrites = args.no_builtin_kbuild_path_rewrites
   user_kbuild_path_rewrites = args.user_kbuild_path_rewrites
@@ -711,6 +718,21 @@ def klocalizerCLI():
       argparser.print_help()
       logger.error("--sample-prefix only to be used with --sample\n")
       exit(12)
+
+  if mutex_algo_choice != "krepairDC" and mutex_algo_choice != "original":
+    argparser.print_help()
+    logger.error("Invalid mutex algorithm choice: %s.  Must be either \"krepairDC\" or \"original\".\n" % mutex_algo_choice)
+    exit(12)
+  if mutex_algo_choice is not None and not mutex_enabled:
+    argparser.print_help()
+    logger.error("--mutex-algo can only be used with --include-mutex.\n")
+    exit(12)
+
+  if num_cores_dc is None:
+    if mutex_algo_choice == "krepairDC":
+        num_cores_dc = max(1, os.cpu_count() - 2)
+    else:
+        num_cores_dc = 1
 
   if not os.path.exists(formulas):
     # create the formula cache directory if it doesn't already exist
@@ -1258,7 +1280,7 @@ def klocalizerCLI():
           start_time = time.time()
 
           # apply algorithm
-          group_sizes, total_deduped_all = krDC.check_constraints_until_unsat_parallel()
+          group_sizes, total_deduped_all = krDC.check_constraints_until_unsat_parallel(num_cores_dc)
 
           # repair configuration files
           apprx_constraints = approximate_constraints.get(arch.name, approximate_constraints.get("default", None))  # get the .config constraints
