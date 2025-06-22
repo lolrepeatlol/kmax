@@ -300,14 +300,14 @@ def compute_patch_coverage(repo, idx):
     with open(patch_cov_log, "w") as logf:
         print(patch_output, file=logf)
         if ratio is not None:
-            print(f"patch_coverage_ratio {ratio}", file=logf)
+            print(f"SCRIPT: patch_coverage {ratio}", file=logf)
 
     if ratio is not None:
-        tqdm.write(f"[JOB {idx}] ✓ patch coverage ratio = {ratio}")
+        tqdm.write(f"[JOB {idx}] ✓ patch coverage = {ratio}")
 
     return ratio
 
-def pielou_evenness(values, idx):
+def pielou_evenness(values, idx) -> Optional[float]:
     """
     Computes Pielou's evenness index (J) for a list of group sizes.
     Returns a value between 0 (completely uneven) and 1 (perfectly even).
@@ -326,7 +326,7 @@ def pielou_evenness(values, idx):
     entropy = -sum(p * math.log(p) for p in proportions)
     # Pielou's J: evenness index
     if n == 1:
-        return 1.0  # Perfectly even by definition (only one group)
+        return None  # we don't care about evenness of a single group
     pielou_j = entropy / math.log(n)
     tqdm.write(f"[JOB {idx}] ✓ evenness = {pielou_j:.4f}")
     return pielou_j
@@ -356,7 +356,7 @@ def compute_group_size_range(values: List[int], idx) -> Tuple[Optional[int], Opt
     tqdm.write(f"[JOB {idx}] ▶ compute_group_size_range on {values}")
     positives = [v for v in values if v > 0]
     if len(positives) < 2:
-        tqdm.write(f"[JOB {idx}] WARNING: Not enough positive group sizes to compute range.")
+        tqdm.write(f"[JOB {idx}] compute_group_size_range: Not enough positive group sizes to compute range.")
         return (None, None)
     tqdm.write(f"[JOB {idx}] ✓ size range = ({max(positives) if positives else 0}, {min(positives) if positives else 0})")
     return (max(positives), min(positives))
@@ -366,11 +366,14 @@ def compute_config_change_percentage(
         original_config: str,
         repaired_configs: List[str],
         idx
-    ) -> Tuple[float, Dict[str, float]]:
+) -> Tuple[float, List[Optional[float]], List[Optional[int]]]:
     """
     Returns:
-        mean_pct   – float   in [0,1]  (average per-config percentage change)
-        per_config – dict[str,float]   {cfg → pct_i}
+        mean_pct       – float in [0,1]           (average per-config percentage change)
+        per_config_pct – List[Optional[float]]    (percentage change, aligned to repaired_configs;
+                                                  None if not a *-x86_64.config or missing data)
+        per_config_raw – List[Optional[int]]      (raw change_wrt_original count, same alignment;
+                                                  None if not a *-x86_64.config or missing data)
     Also writes these results to 'config_change_percentage.txt'.
     """
     tqdm.write(f"[JOB {idx}] ▶ compute_config_change_percentage('{original_config}', {len(repaired_configs)} repairs)")
@@ -386,17 +389,21 @@ def compute_config_change_percentage(
     else:
         tqdm.write("[WARNING] .config did not exist before defconfig regeneration.")
 
-    # 2. regenerate defconfig
-    subprocess.run(['make', 'defconfig'], cwd=repo, check=True)
+    # 2. regenerate defconfig and log output to cccp_defconfig_make.log
+    defconfig_log = Path(repo) / 'cccp_defconfig_make.log'
+    with open(defconfig_log, "w") as logf:
+        subprocess.run(['make', 'defconfig'], cwd=repo, check=True,
+                       stdout=logf, stderr=subprocess.STDOUT)
 
-    # 3. measure_change.py (hard-coded path)
+    # 3. run measure_change.py
     cmd = [
         'python3',
         str(measure_change_path),
         '--original-config', original_config,
         *repaired_configs
     ]
-    result = subprocess.run(cmd, cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    result = subprocess.run(cmd, cwd=repo,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             text=True, check=True)
     data = json.loads(result.stdout)
     repaired_raw = data.get('repaired', {})
@@ -407,7 +414,7 @@ def compute_config_change_percentage(
             for i, entry in enumerate(repaired_raw)
         }
 
-    # 4. sum change_wrt_original (kept for logging / compatibility)
+    # 4. sum change_wrt_original (for logging)
     total_changed = sum(
         entry.get('change_wrt_original', 0)
         for entry in data['repaired'].values()
@@ -429,38 +436,53 @@ def compute_config_change_percentage(
     )
     try:
         total_options = int(opts_res.stdout.strip())
-        tqdm.write(f"[JOB {idx}] total_options = {total_options}")
     except ValueError:
         tqdm.write("[WARNING] Unable to parse total option count.")
         # Also write error to file
         with open(os.path.join(repo, "config_change_percentage.txt"), "w") as f:
             f.write("ERROR: Unable to parse total option count.\n")
-        return -1.0, {}
+        return -1.0, [], []
 
     if total_options <= 0:
         tqdm.write("[WARNING] total_options <= 0, returning -1.")
         with open(os.path.join(repo, "config_change_percentage.txt"), "a") as f:
             f.write("ERROR: total_options <= 0\n")
-        return -1.0, {}
+        return -1.0, [], []
 
-    # 6. build per-config percentage dict
-    per_config_pct = {
-        cfg: info.get('change_wrt_original', 0) / total_options
-        for cfg, info in data.get('repaired', {}).items()
-    }
+    # 6. build per-config lists aligned with repaired_configs
+    per_config_pct: List[Optional[float]] = []
+    per_config_raw: List[Optional[int]] = []
+    repaired_dict = data.get('repaired', {})
 
-    mean_pct = statistics.mean(per_config_pct.values()) if per_config_pct else 0.0
+    for cfg in repaired_configs:
+        if cfg.endswith("-x86_64.config"):
+            key = cfg if cfg in repaired_dict else os.path.basename(cfg)
+            entry = repaired_dict.get(key)
+            raw = entry.get('change_wrt_original', 0) if entry else None
+            pct = (raw / total_options) if raw is not None else None
+            per_config_raw.append(raw)
+            per_config_pct.append(pct)
+        else:
+            per_config_raw.append(None)
+            per_config_pct.append(None)
 
-    tqdm.write(f"[JOB {idx}] ✓ mean_pct = {mean_pct:.4%}, total_changed = {total_changed:.4%}, (configs: {len(per_config_pct)})")
+    # mean percentage over valid entries
+    valid_pcts = [p for p in per_config_pct if p is not None]
+    mean_pct = statistics.mean(valid_pcts) if valid_pcts else 0.0
+
+    tqdm.write(f"[JOB {idx}] ✓ mean_pct = {mean_pct:.4%}, total_changed = {total_changed}, total_options (in kconfig) = {total_options}, (configs: {len(valid_pcts)})")
 
     # 7. Write results to config_change_percentage.txt
     with open(os.path.join(repo, "config_change_percentage.txt"), "w") as f:
         f.write(f"Mean percentage change across configs: {mean_pct:.4%}\n\n")
         f.write("Per-config percentage changes:\n")
-        for cfg, pct in per_config_pct.items():
-            f.write(f"  {cfg}: {pct:.4%}\n")
+        for cfg, pct in zip(repaired_configs, per_config_pct):
+            if pct is not None:
+                f.write(f"  {cfg}: {pct:.4%}\n")
+            else:
+                f.write(f"  {cfg}: [SKIPPED]\n")
 
-    return mean_pct, per_config_pct
+    return mean_pct, per_config_pct, per_config_raw
 
 def process_kernel(args):
     """
@@ -474,14 +496,15 @@ def process_kernel(args):
     code_coverage = 0
     group_sizes = []
     total_constraints = 0
-    pielou_j = 0
+    pielou_j = None
     size_ratio = (None, None)
     time_elapsed_seconds = None
     old_commit: str = ''
     current_commit: str = ''
     commit_count = 0
     config_change_pct = None
-    per_config_pct = {}
+    per_config_pct = []
+    per_config_raw = []
 
     tqdm.write(f"[JOB {idx}] Started processing kernel {repo}")
 
@@ -517,7 +540,7 @@ def process_kernel(args):
             repaired_configs = sorted(
                     str(p) for p in Path(repo).glob('*-x86_64.config')
                 )
-            config_change_pct, per_config_pct = compute_config_change_percentage(
+            config_change_pct, per_config_pct, per_config_raw = compute_config_change_percentage(
                     repo,
                     str(Path(repo) / '.config'),
                     repaired_configs,
@@ -541,7 +564,8 @@ def process_kernel(args):
             'size_ratio':           size_ratio,
             'time_elapsed_seconds': time_elapsed_seconds,
             'config_change_pct':    config_change_pct,
-            'per_config_pct':       per_config_pct
+            'per_config_pct':       per_config_pct,
+            'per_config_raw':       per_config_raw
         }
 
     except Exception as e:
@@ -560,7 +584,7 @@ def write_results_to_csv(results, csv_path):
     """
     Writes a list of result dictionaries to a CSV file.
     Flattens the 'groups' list as JSON and 'size_ratio' tuple as "max,min".
-    Ensures every fieldname is present (filling missing ones with '').
+    Ensures every fieldname is present (filling missing ones with '' or [] as appropriate).
     Skips any None entries.
     """
     fieldnames = [
@@ -578,6 +602,7 @@ def write_results_to_csv(results, csv_path):
         'time_elapsed_seconds',
         'config_change_pct',
         'per_config_pct',
+        'per_config_raw',
         'skip_reason'
     ]
 
@@ -595,29 +620,34 @@ def write_results_to_csv(results, csv_path):
             if not result:
                 continue
 
-            # 1) Copy so we don’t mutate the original
+            # Copy so we don’t mutate the original
             row = result.copy()
 
-            # 2) Ensure every column has *something* ('' if unset)
+            # Ensure every column has *something*
             for key in fieldnames:
-                row.setdefault(key, '')
+                if key in ('per_config_pct', 'per_config_raw', 'groups'):
+                    row.setdefault(key, [])
+                else:
+                    row.setdefault(key, '')
 
-            # 3) Flatten the complex fields
+            # Flatten the complex fields
             row['groups'] = json.dumps(row['groups'])
             if row['size_ratio'] and row['size_ratio'][0] is not None:
                 row['size_ratio'] = f"{row['size_ratio'][0]},{row['size_ratio'][1]}"
             else:
                 row['size_ratio'] = ''
 
-            # 4) config_change_pct can be None or a float
-            #    leave it as-is (None → blank cell)
-            row['config_change_pct'] = row.get('config_change_pct', '')
+            # config_change_pct and evenness can be None or a float
+            if row['config_change_pct'] is None:
+                row['config_change_pct'] = ''
+            if row['evenness'] is None:
+                row['evenness'] = ''
 
-            # 5) per_config_pct is a dict → JSON string
-            row['per_config_pct'] = json.dumps(row.get('per_config_pct', {}))
+            # per_config_pct and per_config_raw are lists --> JSON-encode
+            row['per_config_pct'] = json.dumps(row['per_config_pct'])
+            row['per_config_raw'] = json.dumps(row['per_config_raw'])
 
-            # 6) skip_reason was set by the caller if needed;
-            #    otherwise it’s '', so the column stays blank
+            # skip_reason stays as-is ('' if not present)
             writer.writerow(row)
 
 
@@ -701,12 +731,13 @@ def main():
             'coverage':             None,
             'groups':               [],
             'total_constraints':    0,
-            'evenness':             0,
+            'evenness':             None,
             'size_ratio':           (None, None),
             'time_elapsed_seconds': None,
             'commit_count':         None,
             'config_change_pct':    None,
-            'per_config_pct':       {},
+            'per_config_pct':       [],
+            'per_config_raw':       [],
             'skip_reason':          'blank line in commit list'
         }
         for idx in skipped_idxs
