@@ -504,7 +504,7 @@ def process_kernel(args):
     commit_count = 0
     config_change_pct = None
     per_config_pct = []
-    per_config_raw = []
+    per_config_change = []
 
     tqdm.write(f"[JOB {idx}] Started processing kernel {repo}")
 
@@ -540,7 +540,7 @@ def process_kernel(args):
             repaired_configs = sorted(
                     str(p) for p in Path(repo).glob('*-x86_64.config')
                 )
-            config_change_pct, per_config_pct, per_config_raw = compute_config_change_percentage(
+            config_change_pct, per_config_pct, per_config_change = compute_config_change_percentage(
                     repo,
                     str(Path(repo) / '.config'),
                     repaired_configs,
@@ -566,7 +566,7 @@ def process_kernel(args):
             'time_elapsed_seconds': time_elapsed_seconds,
             'config_change_pct':    config_change_pct,
             'per_config_pct':       per_config_pct,
-            'per_config_raw':       per_config_raw
+            'per_config_change':    per_config_change
         }
 
     except Exception as e:
@@ -604,7 +604,7 @@ def write_results_to_csv(results, csv_path):
         'time_elapsed_seconds',
         'config_change_pct',
         'per_config_pct',
-        'per_config_raw',
+        'per_config_change',
         'skip_reason'
     ]
 
@@ -627,7 +627,7 @@ def write_results_to_csv(results, csv_path):
 
             # Ensure every column has *something*
             for key in fieldnames:
-                if key in ('per_config_pct', 'per_config_raw', 'groups'):
+                if key in ('per_config_pct', 'per_config_change', 'groups'):
                     row.setdefault(key, [])
                 else:
                     row.setdefault(key, '')
@@ -645,9 +645,9 @@ def write_results_to_csv(results, csv_path):
             if row['evenness'] is None:
                 row['evenness'] = ''
 
-            # per_config_pct and per_config_raw are lists --> JSON-encode
+            # per_config_pct and per_config_change are lists --> JSON-encode
             row['per_config_pct'] = json.dumps(row['per_config_pct'])
-            row['per_config_raw'] = json.dumps(row['per_config_raw'])
+            row['per_config_change'] = json.dumps(row['per_config_change'])
 
             # skip_reason stays as-is ('' if not present)
             writer.writerow(row)
@@ -740,7 +740,7 @@ def main():
             'commit_count':         None,
             'config_change_pct':    None,
             'per_config_pct':       [],
-            'per_config_raw':       [],
+            'per_config_change':    [],
             'skip_reason':          'blank line in commit list'
         }
         for idx in skipped_idxs
