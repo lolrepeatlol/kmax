@@ -13,7 +13,8 @@ Usage:
     python3 copy_experiment_outputs.py \
         --mode krepairDC \
         --output-dir /path/to/output \
-        [--base-dir /tmp/testing_kernels]
+        [--base-dir /tmp/testing_kernels] \
+        [--include-outputs]
 """
 
 import argparse
@@ -40,6 +41,7 @@ def gather_patterns(mode):
             '*_coverage_results.json',
             'total_coverage_results.json',
             'defconfig_make.log',
+            'cccp_defconfig_make.log',
             'patchset_*.diff',
             'total_coverage.log',
             'patch_coverage.log',
@@ -47,7 +49,7 @@ def gather_patterns(mode):
             summary,
         ]
 
-def copy_for_mode(base_dir: Path, mode: str, output_dir: Path):
+def copy_for_mode(base_dir: Path, mode: str, output_dir: Path, include_outputs: bool):
     src_root = base_dir / mode
     if not src_root.is_dir():
         print(f"[ERROR] mode directory not found: {src_root}", file=sys.stderr)
@@ -56,6 +58,20 @@ def copy_for_mode(base_dir: Path, mode: str, output_dir: Path):
     # create a timestamped output directory for this run
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     mode_output_dir = output_dir / f"{mode}_{timestamp}"
+    mode_output_dir.mkdir(parents=True, exist_ok=True)
+
+    # optionally copy the global output_<mode>.log and results_<mode>.csv
+    if include_outputs:
+        for fname in (f"output_{mode}.log", f"results_{mode}.csv"):
+            src = output_dir / fname
+            if src.exists():
+                try:
+                    shutil.copy2(src, mode_output_dir)
+                    print(f"Copied {src.name} → {mode_output_dir}/")
+                except Exception as e:
+                    print(f"[ERROR] failed to copy {src}: {e}", file=sys.stderr)
+            else:
+                print(f"[WARN] global file not found: {src}")
 
     patterns = gather_patterns(mode)
 
@@ -100,9 +116,14 @@ def main():
         required=True,
         help="Where to mirror all the logs/results"
     )
+    p.add_argument(
+        '--include-outputs',
+        action='store_true',
+        help="Also copy global output_<mode>.log and results_<mode>.csv into the mode folder. Assumes these files exist in the output directory."
+    )
     args = p.parse_args()
 
-    copy_for_mode(args.base_dir, args.mode, args.output_dir)
+    copy_for_mode(args.base_dir, args.mode, args.output_dir, args.include_outputs)
 
 if __name__ == '__main__':
     main()
