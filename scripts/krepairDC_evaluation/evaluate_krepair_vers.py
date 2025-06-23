@@ -8,6 +8,7 @@ import subprocess
 import argparse
 import statistics
 import sys
+from collections import deque
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -91,38 +92,6 @@ def prepare_worker_dirs(kernel_src: str,
     worker_dirs = [dst for _, dst in results]
     return worker_dirs
 
-def assign_tasks(worker_dirs: List[str],
-                 old_commit_list_file: str,
-                 commit_list_file: str,
-                 max_kernels: int,
-                 time_window: str,
-                 mode: str
-                 ) -> Tuple[List[Tuple[int,str,str,int,str,str,str]], List[int]]:
-    """
-    Read the commits, truncate to max_kernels.  For each non-blank commit pair,
-    pick a worker_dir in round-robin (by idx % len(worker_dirs)) and build
-    a job tuple:
-      (worker_id, repo_dir, time_window, idx, mode, old_sha, new_sha)
-    Returns (jobs, skipped_idxs).
-    """
-    commits     = load_commits(commit_list_file)[:max_kernels]
-    old_commits = load_commits(old_commit_list_file)[:max_kernels]
-
-    jobs: List[Tuple[int,str,str,int,str,str,str]] = []
-    skipped: List[int] = []
-    W = len(worker_dirs)
-
-    for idx, (new_sha, old_sha) in enumerate(zip(commits, old_commits)):
-        if not new_sha or not old_sha:
-            skipped.append(idx)
-        else:
-            worker_id = idx % W
-            worker_dir = worker_dirs[worker_id]
-            jobs.append((worker_id, worker_dir, time_window, idx, mode, old_sha, new_sha))
-
-    print(f"[INFO] Assigned {len(jobs)} commits to {W} worker dirs (skipped {len(skipped)})")
-    return jobs, skipped
-
 def make_patchset(
         repo: str,
         idx: int,
@@ -149,6 +118,12 @@ def make_patchset(
     with open(log_path, "w") as logf:
         subprocess.run(
             ['git', 'clean', '-dfx'],
+            cwd=repo, check=True,
+            stdout=logf, stderr=subprocess.STDOUT
+        )
+
+        subprocess.run(
+            ['git', 'reset', '--hard', 'HEAD'],
             cwd=repo, check=True,
             stdout=logf, stderr=subprocess.STDOUT
         )
@@ -526,7 +501,6 @@ def gather_patterns(mode: str) -> List[str]:
             'total_coverage.log',
             'defconfig_coverage_results.json',
             'patch_coverage.log',
-            'clean_worker.log'
         ]
     elif mode == 'krepairDC':
         return [
@@ -835,15 +809,17 @@ def main():
         max_parallelism=cores
     )
 
-    # Build our job list, reusing worker_dirs in round-robin
-    jobs, skipped_idxs = assign_tasks(
-        worker_dirs,
-        old_commit_list_file,
-        commit_list_file,
-        num_kernels,
-        time_window,
-        mode
+    # Get commits
+    commits     = load_commits(commit_list_file)[:num_kernels]
+    old_commits = load_commits(old_commit_list_file)[:num_kernels]
+
+    # Build pending-commit list (idx, old_sha, new_sha)
+    pending = deque(
+        (idx, old_sha, new_sha)
+        for idx, (new_sha, old_sha) in enumerate(zip(commits, old_commits))
+        if new_sha and old_sha
     )
+    skipped = [idx for idx, (n,o) in enumerate(zip(commits, old_commits)) if not n or not o]
 
     # Pre-populate blank-line skips in results
     results: List[Dict[str, Any]] = [
@@ -866,36 +842,53 @@ def main():
             'per_config_change':    [],
             'skip_reason':          'blank line in commit list'
         }
-        for idx in skipped_idxs
+        for idx in skipped
     ]
 
-    print(f"[INFO] Scheduling {len(jobs)} jobs in mode='{mode}'")
-    for worker_id, repo, _, idx, _, _, _ in jobs:
-        print(f"[INFO]  • Worker {worker_id} → Job {idx}: kernel dir = {repo}")
+    # Prepare executor
+    W = len(worker_dirs)
+    available_workers = deque(range(W))
+    future_to_worker = {}
 
-    # Run at most cores jobs in parallel
-    future_to_job: Dict[Any, Tuple] = {}
     with ProcessPoolExecutor(max_workers=cores) as exe:
-        for job in jobs:
-            fut = exe.submit(process_kernel, job)
-            future_to_job[fut] = job
+        # Kick off up to `cores` initial tasks
+        while available_workers and pending:
+            wid = available_workers.popleft()
+            idx, old_sha, new_sha = pending.popleft()
+            repo = worker_dirs[wid]
+            args = (wid, repo, time_window, idx, mode, old_sha, new_sha)
+            fut = exe.submit(process_kernel, args)
+            future_to_worker[fut] = (wid, idx, new_sha)
 
-        with tqdm(total=len(future_to_job), desc=f"[{mode}] jobs", unit="job") as bar:
-            for fut in as_completed(future_to_job):
-                job = future_to_job[fut]
-                wid, repo_dir, _, idx, _, _, new_sha = job
-                res = fut.result()
+        # As each job finishes, start a new one if available
+        total_jobs = len(pending) + len(future_to_worker)
+        with tqdm(total=total_jobs, desc=f"[{mode}] jobs", unit="job") as pbar:
+            while future_to_worker:
+                done, _ = next(as_completed([*future_to_worker]), (None, None))
+                if done is None:
+                    break
+                wid, idx, sha = future_to_worker.pop(done)
+                res = done.result()
                 results.append(res)
-                bar.update(1)
+                pbar.update(1)
 
-                # immediately export this job's outputs
-                export_job_outputs(mode, repo_dir, idx, new_sha, export_base)
+                # export immediately
+                export_job_outputs(mode, worker_dirs[wid], idx, sha, export_base)
 
+                # reclaim worker and start next pending job
+                available_workers.append(wid)
+                if pending:
+                    wid2 = available_workers.popleft()
+                    idx2, old2, new2 = pending.popleft()
+                    repo2 = worker_dirs[wid2]
+                    args2 = (wid2, repo2, time_window, idx2, mode, old2, new2)
+                    fut2 = exe.submit(process_kernel, args2)
+                    future_to_worker[fut2] = (wid2, idx2, new2)
+
+    # write CSV, finish up…
     results.sort(key=lambda r: r['job_index'])
     write_results_to_csv(results, output_csv)
-
-    success_count = sum(1 for r in results if not r.get('skip_reason'))
-    print(f"Done ({time_window}, {mode}). {success_count} runs succeeded.")
+    print(f"Done ({time_window}, {mode}). {len(results)-len(skipped)} runs succeeded.")
 
 if __name__ == '__main__':
     main()
