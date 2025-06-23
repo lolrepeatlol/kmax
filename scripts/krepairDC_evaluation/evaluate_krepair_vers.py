@@ -46,58 +46,47 @@ def load_commits(path: str) -> List[str]:
 
 def _prepare_single_worker(kernel_src: str, tmp_dir: str, idx: int) -> Tuple[int, str]:
     """
-    Helper for one worker copy/clean.
+    Copy kernel_src → tmp_dir/worker_{idx:03d} if it doesn't already exist.
     Returns (idx, dst_path).
     """
     dst = os.path.join(tmp_dir, f"worker_{idx:03d}")
-    log_path = os.path.join(dst, "clean_worker.log")
-
     if not os.path.exists(dst):
         print(f"[INFO] Copying original kernel to '{dst}'")
         shutil.copytree(kernel_src, dst)
     else:
-        print(f"[INFO] Cleaning existing worker dir '{dst}'")
-        os.makedirs(dst, exist_ok=True)
-        with open(log_path, "w") as logf:
-            subprocess.run(
-                ["git", "clean", "-dfx"],
-                cwd=dst,
-                check=True,
-                stdout=logf,
-                stderr=subprocess.STDOUT
-            )
-
+        print(f"[INFO] Skipping existing worker dir '{dst}'")
     return idx, dst
 
 def prepare_worker_dirs(kernel_src: str,
                         tmp_dir: str,
-                        worker_count: int
+                        worker_count: int,
+                        max_parallelism: int
                         ) -> List[str]:
     """
-    Copy the original kernel source tree worker_count times into
-    tmp_dir/worker_000, worker_001, … in parallel.
+    Ensure `worker_count` worker directories under `tmp_dir`:
+      tmp_dir/worker_000, ..., worker_{worker_count-1:03d}.
 
-    If a worker_X directory already exists, runs:
-      git clean -dfx
-    and logs to clean_worker.log.
+    - If a worker directory does not exist: copy kernel_src → that dir.
+    - If it already exists: do nothing (we rely on make_patchset to clean).
 
-    Returns the list of dst paths in ascending index order.
+    Copy tasks are run in parallel, up to `max_parallelism` at once.
+
+    Returns the list of worker directory paths, in index order.
     """
     os.makedirs(tmp_dir, exist_ok=True)
 
-    # Kick off parallel tasks
-    futures = []
-    with ProcessPoolExecutor(max_workers=worker_count) as exe:
-        for i in range(worker_count):
-            futures.append(exe.submit(_prepare_single_worker, kernel_src, tmp_dir, i))
+    # Prepare argument tuples for each worker index
+    tasks = [(kernel_src, tmp_dir, i) for i in range(worker_count)]
+    results: List[Tuple[int, str]] = []
 
-        # Collect results
-        results: List[Tuple[int,str]] = []
+    # Run copies in parallel, capped at max_parallelism
+    with ProcessPoolExecutor(max_workers=max_parallelism) as exe:
+        futures = [exe.submit(_prepare_single_worker, *t) for t in tasks]
         for fut in as_completed(futures):
             idx, dst = fut.result()
             results.append((idx, dst))
 
-    # Sort by idx and return only the paths
+    # Sort by worker index and return only the paths
     results.sort(key=lambda x: x[0])
     worker_dirs = [dst for _, dst in results]
     return worker_dirs
@@ -841,9 +830,12 @@ def main():
     # Make sure the temporary directory exists
     os.makedirs(tmp_dir, exist_ok=True)
 
-    # We'll only need this many copies
-    copy_count = min(cores, 8)
-    worker_dirs = prepare_worker_dirs(kernels_src, tmp_dir, copy_count)
+    worker_dirs = prepare_worker_dirs(
+        kernels_src,
+        tmp_dir,
+        worker_count=num_kernels,
+        max_parallelism=cores
+    )
 
     # Build our job list, reusing worker_dirs in round-robin
     jobs, skipped_idxs = assign_tasks(
