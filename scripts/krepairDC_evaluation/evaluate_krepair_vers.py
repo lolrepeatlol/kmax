@@ -780,7 +780,7 @@ def main():
         help='Path to file listing old (reference) commits.'
     )
     parser.add_argument(
-        'time-window', type=str, dest='time_window',
+        'time_window', type=str,
         help='Time window label for patchset (e.g., 12h, 72h, 7d). Only used for labeling in CSV output.'
     )
     parser.add_argument(
