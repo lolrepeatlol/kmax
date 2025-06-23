@@ -9,6 +9,7 @@ import argparse
 import statistics
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from datetime import datetime
 from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional
 from tqdm import tqdm
@@ -43,75 +44,82 @@ def load_commits(path: str) -> List[str]:
     print(f"[INFO] Loaded {len(commits)} commits from {path}")
     return commits
 
-def copy_kernel_multiple_times(kernel_src: str,
-                               tmp_dir: str,
-                               mode: str,
-                               old_commit_list_file: str,
-                               commit_list_file: str,
-                               max_kernels: int,
-                               cores: int
-                               ) -> Tuple[List[Tuple[int, str, str, str]], List[int]]:
+def prepare_worker_dirs(kernel_src: str,
+                        tmp_dir: str,
+                        worker_count: int
+                        ) -> List[str]:
     """
-    Parallel-copy the kernel tree once per *non-blank* commit, placing each copy
-    under tmp_dir/<mode>/, using up to `cores` workers.
-    Returns:
-      copied   – [(idx, dst_path), …]  sorted by idx
-      skipped  – [idx, idx, …]         for blank-line entries
-    """
-    print(f"[INFO] Copying kernels from {kernel_src} to {tmp_dir}/{mode} (max {max_kernels} kernels, {cores} cores)")
-    dest_root = os.path.join(tmp_dir, mode)
-    os.makedirs(dest_root, exist_ok=True)
+    Copy the original kernel source tree worker_count times, once each into
+    tmp_dir/worker_00, worker_01, …
 
-    commits = load_commits(commit_list_file)[:max_kernels]
+    If a worker_X directory already exists, run git clean -dfx
+    to reset it back to a pristine state, logging output to clean_worker.log.
+
+    Returns the list of those directories.
+    """
+    os.makedirs(tmp_dir, exist_ok=True)
+
+    worker_dirs: List[str] = []
+    for i in range(worker_count):
+        dst = os.path.join(tmp_dir, f"worker_{i:02d}")
+        if not os.path.exists(dst):
+            print(f"[INFO] Copying original kernel to '{dst}'")
+            shutil.copytree(kernel_src, dst)
+        else:
+            print(f"[INFO] Cleaning existing worker dir '{dst}'")
+            log_path = os.path.join(dst, "clean_worker.log")
+            with open(log_path, "w") as logf:
+                subprocess.run(["git", "clean", "-dfx"], cwd=dst, check=True,
+                               stdout=logf, stderr=subprocess.STDOUT)
+        worker_dirs.append(dst)
+
+    return worker_dirs
+
+def assign_tasks(worker_dirs: List[str],
+                 old_commit_list_file: str,
+                 commit_list_file: str,
+                 max_kernels: int,
+                 time_window: str,
+                 mode: str
+                 ) -> Tuple[List[Tuple[int,str,str,int,str,str,str]], List[int]]:
+    """
+    Read the commits, truncate to max_kernels.  For each non-blank commit pair,
+    pick a worker_dir in round-robin (by idx % len(worker_dirs)) and build
+    a job tuple:
+      (worker_id, repo_dir, time_window, idx, mode, old_sha, new_sha)
+    Returns (jobs, skipped_idxs).
+    """
+    commits     = load_commits(commit_list_file)[:max_kernels]
     old_commits = load_commits(old_commit_list_file)[:max_kernels]
 
-    tasks: List[Tuple[int,str,str,str]] = []
+    jobs: List[Tuple[int,str,str,int,str,str,str]] = []
     skipped: List[int] = []
+    W = len(worker_dirs)
+
     for idx, (new_sha, old_sha) in enumerate(zip(commits, old_commits)):
         if not new_sha or not old_sha:
             skipped.append(idx)
         else:
-            dst = os.path.join(dest_root, f"{idx:03d}_{new_sha[:7]}")
-            tasks.append((idx, new_sha, old_sha, dst))
+            worker_id = idx % W
+            worker_dir = worker_dirs[worker_id]
+            jobs.append((worker_id, worker_dir, time_window, idx, mode, old_sha, new_sha))
 
-    results: List[Tuple[int, str, str, str]] = []
-    with ProcessPoolExecutor(max_workers=cores) as execr:
-        # pass kernel_src and each task to the top-level function
-        future_to_idx = {
-            execr.submit(_copy_single_kernel_task, kernel_src, t): t[0]
-            for t in tasks
-        }
-        for fut in as_completed(future_to_idx):
-            results.append(fut.result())
-
-    results.sort(key=lambda x: x[0])
-    return results, skipped
-
-def _copy_single_kernel_task(kernel_src: str,
-                             task: Tuple[int, str, str, str]
-                             ) -> Tuple[int, str, str, str]:
-    idx, new_sha, old_sha, dst_path = task
-    """
-    Top-level helper so it can be pickled.
-    task = (idx, sha, dst_path)
-    """
-    print(f"[INFO] Copying kernel #{idx} to '{dst_path}'")
-    if not os.path.exists(dst_path):
-        shutil.copytree(kernel_src, dst_path)
-    return idx, dst_path, old_sha, new_sha
+    print(f"[INFO] Assigned {len(jobs)} commits to {W} worker dirs (skipped {len(skipped)})")
+    return jobs, skipped
 
 def make_patchset(
         repo: str,
         idx: int,
         old_sha: str,
-        new_sha: str
+        new_sha: str,
+        worker_id
 ) -> Tuple[Path, int, str, str]:
     """
     Given an `old_sha` and `new_sha`, checkout `new_sha` in `repo`,
     count commits in old..new, and `git diff old..new` → patchset_{idx}.diff.
     Returns (patch_path, commit_count, old_sha, new_sha).
     """
-    tqdm.write(f"[JOB {idx}] ▶ make_patchset: repo={repo}")
+    tqdm.write(f"[JOB {idx}] [WORKER {worker_id}] ▶ make_patchset: repo={repo}")
 
     # detect blanks
     if not new_sha:
@@ -151,13 +159,13 @@ def make_patchset(
             cwd=repo, stdout=outf, stderr=logf, check=True
         )
 
-    tqdm.write(f"[JOB {idx}] ✓ patchset: {old_sha} → {new_sha} ({commit_count} commits), patch at {patch_path}")
+    tqdm.write(f"[JOB {idx}] [WORKER {worker_id}] ✓ patchset: {old_sha} → {new_sha} ({commit_count} commits), patch at {patch_path}")
 
     return patch_path, commit_count, old_sha, new_sha
 
-def run_krepair(repo, patch_path, mode, idx):
+def run_krepair(repo, patch_path, mode, idx, worker_id):
     """Runs klocalizer in the specified repair mode on the given repo."""
-    tqdm.write(f"[JOB {idx}] ▶ run_krepair: mode={mode}, repo={repo}")
+    tqdm.write(f"[JOB {idx}] [WORKER {worker_id}] ▶ run_krepair: mode={mode}, repo={repo}")
 
     defconfig_log = Path(repo) / 'defconfig_make.log'
     # generate .config
@@ -186,12 +194,12 @@ def run_krepair(repo, patch_path, mode, idx):
             executable='/bin/bash', check=True
         )
 
-    tqdm.write(f"[JOB {idx}] ✓ run_krepair done; output saved to {output_file}")
+    tqdm.write(f"[JOB {idx}] [WORKER {worker_id}] ✓ run_krepair done; output saved to {output_file}")
     return output_file
 
-def run_olddefconfig_and_koverage(repo, patch_path, idx):
+def run_olddefconfig_and_koverage(repo, patch_path, idx, worker_id):
     """Runs olddefconfig and koverage for all *-x86_64.config files in repo."""
-    tqdm.write(f"[JOB {idx}] ▶ olddefconfig + koverage on {repo}")
+    tqdm.write(f"[JOB {idx}] [WORKER {worker_id}] ▶ olddefconfig + koverage on {repo}")
     configs = sorted(str(f) for f in Path(repo).glob('*-x86_64.config'))
 
     # Run olddefconfig for each config
@@ -212,14 +220,14 @@ def run_olddefconfig_and_koverage(repo, patch_path, idx):
         with open(Path(repo) / out_log, "w") as logf:
             subprocess.run(cmd, cwd=repo, shell=True, executable='/bin/bash', check=True, stdout=logf, stderr=subprocess.STDOUT)
 
-    tqdm.write(f"[JOB {idx}] ✓ olddefconfig+koverage complete")
+    tqdm.write(f"[JOB {idx}] [WORKER {worker_id}] ✓ olddefconfig+koverage complete")
 
-def run_defconfig_and_koverage(repo, patch_path, idx):
+def run_defconfig_and_koverage(repo, patch_path, idx, worker_id):
     """
     In defconfig mode, just do `make defconfig` and run koverage once
     on the resulting .config, producing a single JSON.
     """
-    tqdm.write(f"[JOB {idx}] ▶ defconfig+koverage on {repo}")
+    tqdm.write(f"[JOB {idx}] [WORKER {worker_id}] ▶ defconfig+koverage on {repo}")
     defconfig_log = Path(repo) / 'defconfig_make.log'
     # regenerate .config
     with open(defconfig_log, "w") as logf:
@@ -237,9 +245,9 @@ def run_defconfig_and_koverage(repo, patch_path, idx):
     )
     with open(koverage_log, "w") as logf:
         subprocess.run(cmd, cwd=repo, shell=True, executable='/bin/bash', check=True, stdout=logf, stderr=subprocess.STDOUT)
-    tqdm.write(f"[JOB {idx}] ✓ defconfig+koverage complete")
+    tqdm.write(f"[JOB {idx}] [WORKER {worker_id}] ✓ defconfig+koverage complete")
 
-def compute_patch_coverage(repo, idx):
+def compute_patch_coverage(repo, idx, worker_id):
     """
     Runs total_coverage.py on all *_coverage_results.json files in repo,
     then runs patch_coverage.py on the merged output. Returns the coverage ratio.
@@ -252,7 +260,7 @@ def compute_patch_coverage(repo, idx):
     total_coverage_path = (script_dir / '../krepair_evaluation/paper/total_coverage.py').resolve()
     patch_coverage_path = (script_dir / '../krepair_evaluation/paper/patch_coverage.py').resolve()
 
-    tqdm.write(f"[JOB {idx}] ▶ compute_patch_coverage in {repo}")
+    tqdm.write(f"[JOB {idx}] [WORKER {worker_id}] ▶ compute_patch_coverage in {repo}")
     # Collect all coverage result JSON files
     coverage_files = [str(p) for p in Path(repo).glob('*_coverage_results.json')]
     if not coverage_files:
@@ -303,16 +311,16 @@ def compute_patch_coverage(repo, idx):
             print(f"SCRIPT: patch_coverage {ratio}", file=logf)
 
     if ratio is not None:
-        tqdm.write(f"[JOB {idx}] ✓ patch coverage = {ratio}")
+        tqdm.write(f"[JOB {idx}] [WORKER {worker_id}] ✓ patch coverage = {ratio}")
 
     return ratio
 
-def pielou_evenness(values, idx) -> Optional[float]:
+def pielou_evenness(values, idx, worker_id) -> Optional[float]:
     """
     Computes Pielou's evenness index (J) for a list of group sizes.
     Returns a value between 0 (completely uneven) and 1 (perfectly even).
     """
-    tqdm.write(f"[JOB {idx}] ▶ pielou_evenness on {len(values)} values")
+    tqdm.write(f"[JOB {idx}] [WORKER {worker_id}] ▶ pielou_evenness on {len(values)} values")
     values = [v for v in values if v > 0]  # Ignore zeroes (as is standard)
     n = len(values)
     if n == 0:
@@ -328,44 +336,45 @@ def pielou_evenness(values, idx) -> Optional[float]:
     if n == 1:
         return None  # we don't care about evenness of a single group
     pielou_j = entropy / math.log(n)
-    tqdm.write(f"[JOB {idx}] ✓ evenness = {pielou_j:.4f}")
+    tqdm.write(f"[JOB {idx}] [WORKER {worker_id}] ✓ evenness = {pielou_j:.4f}")
     return pielou_j
 
-def parse_summary_csv(summary_file: str, idx) -> Tuple[List[int], int, float]:
+def parse_summary_csv(summary_file: str, idx, worker_id) -> Tuple[List[int], int, float]:
     """
     Reads the single‐row summary CSV and returns:
       - group_sizes: List[int]
       - total_constraints: int (the CSV's `total_deduped_all` column)
       - time_elapsed_seconds: float (the CSV's `time_elapsed_seconds` column)
     """
-    tqdm.write(f"[JOB {idx}] ▶ parse_summary_csv('{summary_file}')")
+    tqdm.write(f"[JOB {idx}] [WORKER {worker_id}] ▶ parse_summary_csv('{summary_file}')")
     with open(summary_file, newline='') as csvfile:
         reader = csv.DictReader(csvfile)
         row = next(reader)
         group_sizes = json.loads(row['group_sizes'])
         total_constraints = int(row['total_deduped_all'])
         time_elapsed_seconds = float(row['time_elapsed_seconds'])
-        tqdm.write(f"[JOB {idx}] ✓ parsed: groups={len(group_sizes)}, total={total_constraints}, time={time_elapsed_seconds:.2f}s")
+        tqdm.write(f"[JOB {idx}] [WORKER {worker_id}] ✓ parsed: groups={len(group_sizes)}, total={total_constraints}, time={time_elapsed_seconds:.2f}s")
         return group_sizes, total_constraints, time_elapsed_seconds
 
-def compute_group_size_range(values: List[int], idx) -> Tuple[Optional[int], Optional[int]]:
+def compute_group_size_range(values: List[int], idx, worker_id) -> Tuple[Optional[int], Optional[int]]:
     """
     Returns (largest_group, smallest_group), ignoring zeros.
     If there are no positive values, returns (0, 0).
     """
-    tqdm.write(f"[JOB {idx}] ▶ compute_group_size_range on {values}")
+    tqdm.write(f"[JOB {idx}] [WORKER {worker_id}] ▶ compute_group_size_range on {values}")
     positives = [v for v in values if v > 0]
     if len(positives) < 2:
-        tqdm.write(f"[JOB {idx}] compute_group_size_range: Not enough positive group sizes to compute range.")
+        tqdm.write(f"[JOB {idx}] [WORKER {worker_id}] compute_group_size_range: Not enough positive group sizes to compute range.")
         return (None, None)
-    tqdm.write(f"[JOB {idx}] ✓ size range = ({max(positives) if positives else 0}, {min(positives) if positives else 0})")
+    tqdm.write(f"[JOB {idx}] [WORKER {worker_id}] ✓ size range = ({max(positives) if positives else 0}, {min(positives) if positives else 0})")
     return (max(positives), min(positives))
 
 def compute_config_change_percentage(
         repo: str,
         original_config: str,
         repaired_configs: List[str],
-        idx
+        idx,
+        worker_id
 ) -> Tuple[float, List[Optional[float]], List[Optional[int]]]:
     """
     Returns:
@@ -376,7 +385,7 @@ def compute_config_change_percentage(
                                                   None if not a *-x86_64.config or missing data)
     Also writes these results to 'config_change_percentage.txt'.
     """
-    tqdm.write(f"[JOB {idx}] ▶ compute_config_change_percentage('{original_config}', {len(repaired_configs)} repairs)")
+    tqdm.write(f"[JOB {idx}] [WORKER {worker_id}] ▶ compute_config_change_percentage('{original_config}', {len(repaired_configs)} repairs)")
 
     # get absolute path to script directory and measure_change.py
     script_dir = Path(__file__).resolve().parent
@@ -387,7 +396,7 @@ def compute_config_change_percentage(
     if config_path.exists():
         config_path.unlink()
     else:
-        tqdm.write("[WARNING] .config did not exist before defconfig regeneration.")
+        tqdm.write(f"[JOB {idx}] [WORKER {worker_id}] [WARNING] .config did not exist before defconfig regeneration.")
 
     # 2. regenerate defconfig and log output to cccp_defconfig_make.log
     defconfig_log = Path(repo) / 'cccp_defconfig_make.log'
@@ -437,14 +446,14 @@ def compute_config_change_percentage(
     try:
         total_options = int(opts_res.stdout.strip())
     except ValueError:
-        tqdm.write("[WARNING] Unable to parse total option count.")
+        tqdm.write(f"[JOB {idx}] [WORKER {worker_id}] [WARNING] Unable to parse total option count.")
         # Also write error to file
         with open(os.path.join(repo, "config_change_percentage.txt"), "w") as f:
             f.write("ERROR: Unable to parse total option count.\n")
         return -1.0, [], []
 
     if total_options <= 0:
-        tqdm.write("[WARNING] total_options <= 0, returning -1.")
+        tqdm.write(f"[JOB {idx}] [WORKER {worker_id}] [WARNING] total_options <= 0, returning -1.")
         with open(os.path.join(repo, "config_change_percentage.txt"), "a") as f:
             f.write("ERROR: total_options <= 0\n")
         return -1.0, [], []
@@ -470,7 +479,7 @@ def compute_config_change_percentage(
     valid_pcts = [p for p in per_config_pct if p is not None]
     mean_pct = statistics.mean(valid_pcts) if valid_pcts else 0.0
 
-    tqdm.write(f"[JOB {idx}] ✓ mean_pct = {mean_pct:.4%}, total_changed = {total_changed}, total_options (in kconfig) = {total_options}, (configs: {len(valid_pcts)})")
+    tqdm.write(f"[JOB {idx}] [WORKER {worker_id}] ✓ mean_pct = {mean_pct:.4%}, total_changed = {total_changed}, total_options (in kconfig) = {total_options}, (configs: {len(valid_pcts)})")
 
     # 7. Write results to config_change_percentage.txt
     with open(os.path.join(repo, "config_change_percentage.txt"), "w") as f:
@@ -484,13 +493,100 @@ def compute_config_change_percentage(
 
     return mean_pct, per_config_pct, per_config_raw
 
+def gather_patterns(mode: str) -> List[str]:
+    """
+    Return the list of file patterns to collect for each kernel experiment result,
+    depending on the repair mode.
+
+    - For 'defconfig': log, diff, and coverage files only.
+    - For 'krepairDC': includes summary, configs, logs, coverage, SMT2 final chunks, etc.
+    - For 'krepair'  : includes summary, configs, logs, coverage, patch/original constraints, etc.
+    """
+    if mode == 'defconfig':
+        return [
+            'defconfig_koverage.log',
+            'defconfig_make.log',
+            'patchset_*.diff',
+            'total_coverage.log',
+            'defconfig_coverage_results.json',
+            'patch_coverage.log',
+            'clean_worker.log'
+        ]
+    elif mode == 'krepairDC':
+        return [
+            '*-x86_64.config',
+            'clean_worker.log'
+            '*_koverage.log',
+            '*_coverage_results.json',
+            'total_coverage_results.json',
+            'defconfig_make.log',
+            'cccp_defconfig_make.log',
+            'patchset_*.diff',
+            'total_coverage.log',
+            'patch_coverage.log',
+            'config_change_percentage.txt',
+            'krepairDC_summary.csv',
+            'final_chunk_*.smt2',
+        ]
+    elif mode == 'krepair':
+        return [
+            '*-x86_64.config',
+            'clean_worker.log'
+            '*_koverage.log',
+            '*_coverage_results.json',
+            'total_coverage_results.json',
+            'defconfig_make.log',
+            'cccp_defconfig_make.log',
+            'patchset_*.diff',
+            'total_coverage.log',
+            'patch_coverage.log',
+            'config_change_percentage.txt',
+            'krepair_summary.csv',
+            'covered_patch_constraints_*_arch_x86_64.json',
+            'patch_constraints.json',
+            'original_krepair_smt.smt2',
+        ]
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
+
+def export_job_outputs(
+        mode: str,
+        repo_dir: str,
+        idx: int,
+        sha: str,
+        export_base: Path
+) -> None:
+    """
+    Copy all experiment result files matching the expected patterns for this mode
+    from a worker directory to the export destination for the given job.
+
+    Creates a subfolder: export_base/{idx}_{sha7}/
+    and copies each file matching gather_patterns(mode) into it.
+    """
+    repo_path = Path(repo_dir)
+    dest = export_base / f"{idx}_{sha[:7]}"
+    dest.mkdir(parents=True, exist_ok=True)
+    print(f"[EXPORT] Exporting results for job {idx} ({sha[:7]}) from '{repo_dir}' → '{dest}'")
+
+    for pat in gather_patterns(mode):
+        matches = list(repo_path.glob(pat))
+        print(f"[EXPORT] Pattern '{pat}' → {len(matches)} match(es)")
+        if not matches:
+            print(f"[EXPORT][WARN] No files matching '{pat}' in {repo_dir}")
+        for src in matches:
+            try:
+                shutil.copy2(src, dest)
+                print(f"[EXPORT] Copied '{src.name}' → '{dest}/'")
+            except Exception as e:
+                print(f"[EXPORT][ERROR] Failed to copy '{src}': {e}", file=sys.stderr)
+
 def process_kernel(args):
     """
     Orchestrates the end-to-end experimental run for a single kernel configuration.
     Depending on mode, runs defconfig, krepair, or krepairDC, collects results,
     and returns a dictionary of experiment metrics.
     """
-    repo, time_window, idx, mode, old_sha, new_sha = args
+    worker_id, repo, time_window, idx, mode, old_sha, new_sha = args
 
     # Initialize all result variables with default values
     code_coverage = 0
@@ -506,35 +602,35 @@ def process_kernel(args):
     per_config_pct = []
     per_config_change = []
 
-    tqdm.write(f"[JOB {idx}] Started processing kernel {repo}")
+    tqdm.write(f"[JOB {idx}] [WORKER {worker_id}] Started processing kernel {repo}")
 
     try:
         # 1. Generate the patch between historical and selected commit.
         #    Also get the number of commits in the diff range.
         patch, commit_count, old_commit, current_commit = make_patchset(
-            repo, idx, old_sha, new_sha
+            repo, idx, old_sha, new_sha, worker_id
         )
 
         # 2. Run the appropriate experiment step
         if mode == 'defconfig':
             # Run defconfig and coverage analysis
-            run_defconfig_and_koverage(repo, patch, idx)
+            run_defconfig_and_koverage(repo, patch, idx, worker_id)
         else:
             # Run krepair/krepairDC and follow-up coverage analysis
-            run_krepair(repo, patch, mode, idx)
-            run_olddefconfig_and_koverage(repo, patch, idx)
+            run_krepair(repo, patch, mode, idx, worker_id)
+            run_olddefconfig_and_koverage(repo, patch, idx, worker_id)
 
         # 3. Collect code coverage results from coverage tool
-        code_coverage = compute_patch_coverage(repo, idx)
+        code_coverage = compute_patch_coverage(repo, idx, worker_id)
 
         # 4. For krepair modes, gather group stats and timing from summary CSV
         if mode != 'defconfig':
             summary_file = str(Path(repo) / ('krepair_summary.csv' if mode=='krepair' else 'krepairDC_summary.csv'))
             # Parse group sizes, total constraint count, and elapsed time
-            group_sizes, total_constraints, time_elapsed_seconds = parse_summary_csv(summary_file, idx)
+            group_sizes, total_constraints, time_elapsed_seconds = parse_summary_csv(summary_file, idx, worker_id)
             # Compute Pielou's evenness and group size ratio
-            pielou_j   = pielou_evenness(group_sizes, idx)
-            size_ratio = compute_group_size_range(group_sizes, idx)
+            pielou_j   = pielou_evenness(group_sizes, idx, worker_id)
+            size_ratio = compute_group_size_range(group_sizes, idx, worker_id)
 
             # measure how much configs changed under krepair/krepairDC
             repaired_configs = sorted(
@@ -544,10 +640,11 @@ def process_kernel(args):
                     repo,
                     str(Path(repo) / '.config'),
                     repaired_configs,
-                    idx
+                    idx,
+                    worker_id
                 )
 
-        tqdm.write(f"[JOB {idx}] Finished processing kernel {repo}")
+        tqdm.write(f"[JOB {idx}] [WORKER {worker_id}] Finished processing kernel {repo}")
 
         # 5. Return all experiment results as a dictionary
         return {
@@ -570,7 +667,7 @@ def process_kernel(args):
         }
 
     except Exception as e:
-        tqdm.write(f"[JOB {idx}] Error processing kernel {repo}: {e}")
+        tqdm.write(f"[JOB {idx}] [WORKER {worker_id}] Error processing kernel {repo}: {e}")
         return {
             'job_index': idx,
             'mode':      mode,
@@ -683,7 +780,7 @@ def main():
         help='Path to file listing old (reference) commits.'
     )
     parser.add_argument(
-        'time_window', type=str,
+        'time-window', type=str, dest='time_window',
         help='Time window label for patchset (e.g., 12h, 72h, 7d). Only used for labeling in CSV output.'
     )
     parser.add_argument(
@@ -691,9 +788,8 @@ def main():
         help='Repair mode: krepair for krepair, krepairDC for krepairDC, defconfig for non-repaired defconfig .config coverage'
     )
     parser.add_argument(
-        '--output-csv', type=str, default=None,
-        help='Path to write the aggregated results CSV. '
-             'Defaults to ./results_{mode}_{time_window}.csv'
+        '--export-dir', type=str, default=None, required=True,
+        help='Path to write the per-run exports, including the final CSV file.'
     )
     args = parser.parse_args()
 
@@ -706,23 +802,33 @@ def main():
     time_window = args.time_window
     mode = args.mode
     num_kernels = args.num_kernels
+    export_root = Path(args.export_dir)
 
-    # Set output CSV default dynamically if not specified
-    if args.output_csv is None:
-        output_csv = f'results_{mode}_{time_window}.csv'
-    else:
-        output_csv = args.output_csv
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    export_base = export_root / f"{mode}_{timestamp}"
+    export_base.mkdir(parents=True, exist_ok=True)
+
+    # decide where to write our aggregate CSV: place it inside export_base
+    output_csv = export_base / f"results_{mode}_{time_window}.csv"
 
     # Make sure the temporary directory exists
     os.makedirs(tmp_dir, exist_ok=True)
 
-    # Prepare kernel repos
-    copy_cores = min(cores, 8)  # limit copy parallelism to avoid overload
-    copied_kernels, skipped_idxs = copy_kernel_multiple_times(
-        kernels_src, tmp_dir, mode, old_commit_list_file, commit_list_file, num_kernels, copy_cores
+    # We'll only need this many copies
+    copy_count = min(cores, 8)
+    worker_dirs = prepare_worker_dirs(kernels_src, tmp_dir, copy_count)
+
+    # Build our job list, reusing worker_dirs in round-robin
+    jobs, skipped_idxs = assign_tasks(
+        worker_dirs,
+        old_commit_list_file,
+        commit_list_file,
+        num_kernels,
+        time_window,
+        mode
     )
 
-    # Pre-create result rows for every blank-line skip
+    # Pre-populate blank-line skips in results
     results: List[Dict[str, Any]] = [
         {
             'job_index':            idx,
@@ -746,38 +852,34 @@ def main():
         for idx in skipped_idxs
     ]
 
-    # Build a list of jobs: (kernel_dir, time_window, job_index, mode, old_sha, new_sha) for each kernel
-    jobs = [
-        (kernel_dir, time_window, commit_idx, mode, old_sha, new_sha)
-        for (commit_idx, kernel_dir, old_sha, new_sha) in copied_kernels
-    ]
-
     print(f"[INFO] Scheduling {len(jobs)} jobs in mode='{mode}'")
-    for commit_idx, kernel_dir, old_sha, new_sha in copied_kernels:
-        print(f"[INFO]  • Job {commit_idx}: kernel dir = {kernel_dir}")
+    for worker_id, repo, _, idx, _, _, _ in jobs:
+        print(f"[INFO]  • Worker {worker_id} → Job {idx}: kernel dir = {repo}")
 
-    # Process the jobs in parallel
-    with ProcessPoolExecutor(max_workers=cores) as executor:
-        # 1) submit all the jobs
-        futures = [executor.submit(process_kernel, job) for job in jobs]
+    # Run at most copy_count jobs in parallel, matching the number of copies
+    future_to_job: Dict[Any, Tuple] = {}
+    with ProcessPoolExecutor(max_workers=copy_count) as exe:
+        for job in jobs:
+            fut = exe.submit(process_kernel, job)
+            future_to_job[fut] = job
 
-        # 2) create a tqdm bar up front
-        with tqdm(total=len(futures),
-                  desc=f"[{mode}] jobs",
-                  unit="job") as pbar:
-            # 3) as each future completes, grab it and advance the bar
-            for future in as_completed(futures):
-                results.append(future.result())
-                pbar.update(1)
+        with tqdm(total=len(future_to_job), desc=f"[{mode}] jobs", unit="job") as bar:
+            for fut in as_completed(future_to_job):
+                job = future_to_job[fut]
+                wid, repo_dir, _, idx, _, _, new_sha = job
+                res = fut.result()
+                results.append(res)
+                bar.update(1)
 
-    results.sort(key=lambda r: r['job_index'])  # just in case
+                # immediately export this job's outputs
+                if not res.get('skip_reason'):
+                    export_job_outputs(mode, repo_dir, idx, new_sha, export_base)
 
-    # Write the results to CSV
+    results.sort(key=lambda r: r['job_index'])
     write_results_to_csv(results, output_csv)
 
-    # Output the result summary
     success_count = sum(1 for r in results if not r.get('skip_reason'))
-    print(f"Done ({args.time_window}, {mode}). {success_count} runs succeeded.")
+    print(f"Done ({time_window}, {mode}). {success_count} runs succeeded.")
 
 if __name__ == '__main__':
     main()
