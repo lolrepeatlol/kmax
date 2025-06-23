@@ -872,8 +872,7 @@ def main():
                 pbar.update(1)
 
                 # Export immediately if it ran at all
-                if not res.get('skip_reason'):
-                    export_job_outputs(mode, worker_dirs[wid], idx, sha, export_base)
+                export_job_outputs(mode, worker_dirs[wid], idx, sha, export_base)
 
                 # Mark this worker as free
                 available_workers.append(wid)
