@@ -50,7 +50,7 @@ def prepare_worker_dirs(kernel_src: str,
                         ) -> List[str]:
     """
     Copy the original kernel source tree worker_count times, once each into
-    tmp_dir/worker_00, worker_01, …
+    tmp_dir/worker_000, worker_001, …
 
     If a worker_X directory already exists, run git clean -dfx
     to reset it back to a pristine state, logging output to clean_worker.log.
@@ -61,7 +61,7 @@ def prepare_worker_dirs(kernel_src: str,
 
     worker_dirs: List[str] = []
     for i in range(worker_count):
-        dst = os.path.join(tmp_dir, f"worker_{i:02d}")
+        dst = os.path.join(tmp_dir, f"worker_{i:03d}")
         if not os.path.exists(dst):
             print(f"[INFO] Copying original kernel to '{dst}'")
             shutil.copytree(kernel_src, dst)
