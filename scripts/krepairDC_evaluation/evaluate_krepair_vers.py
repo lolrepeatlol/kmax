@@ -875,9 +875,9 @@ def main():
     for worker_id, repo, _, idx, _, _, _ in jobs:
         print(f"[INFO]  • Worker {worker_id} → Job {idx}: kernel dir = {repo}")
 
-    # Run at most copy_count jobs in parallel, matching the number of copies
+    # Run at most cores jobs in parallel
     future_to_job: Dict[Any, Tuple] = {}
-    with ProcessPoolExecutor(max_workers=copy_count) as exe:
+    with ProcessPoolExecutor(max_workers=cores) as exe:
         for job in jobs:
             fut = exe.submit(process_kernel, job)
             future_to_job[fut] = job
