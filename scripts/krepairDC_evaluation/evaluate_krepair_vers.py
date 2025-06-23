@@ -802,6 +802,7 @@ def main():
     # Make sure the temporary directory exists
     os.makedirs(tmp_dir, exist_ok=True)
 
+    # Prepare worker dirs
     worker_dirs = prepare_worker_dirs(
         kernels_src,
         tmp_dir,
@@ -809,7 +810,7 @@ def main():
         max_parallelism=cores
     )
 
-    # Get commits
+    # Load & split commits
     commits     = load_commits(commit_list_file)[:num_kernels]
     old_commits = load_commits(old_commit_list_file)[:num_kernels]
 
@@ -845,47 +846,50 @@ def main():
         for idx in skipped
     ]
 
-    # Prepare executor
-    W = len(worker_dirs)
-    available_workers = deque(range(W))
-    future_to_worker = {}
+    total_jobs = len(pending)                         # all non-blank commits
+    available_workers = deque(range(cores))           # 0 … cores-1
+    futures: Dict[Any, Tuple[int, int, str]] = {}     # Future → (wid, idx, sha)
 
     with ProcessPoolExecutor(max_workers=cores) as exe:
-        # Kick off up to `cores` initial tasks
+        # Kick off the first batch (≤ cores jobs)
         while available_workers and pending:
             wid = available_workers.popleft()
             idx, old_sha, new_sha = pending.popleft()
             repo = worker_dirs[wid]
-            args = (wid, repo, time_window, idx, mode, old_sha, new_sha)
-            fut = exe.submit(process_kernel, args)
-            future_to_worker[fut] = (wid, idx, new_sha)
+            fut = exe.submit(
+                process_kernel,
+                (wid, repo, time_window, idx, mode, old_sha, new_sha)
+            )
+            futures[fut] = (wid, idx, new_sha)
 
-        # As each job finishes, start a new one if available
-        total_jobs = len(pending) + len(future_to_worker)
         with tqdm(total=total_jobs, desc=f"[{mode}] jobs", unit="job") as pbar:
-            while future_to_worker:
-                done, _ = next(as_completed([*future_to_worker]), (None, None))
-                if done is None:
-                    break
-                wid, idx, sha = future_to_worker.pop(done)
+            while futures:
+                # Wait for any currently-running job to finish
+                done = next(as_completed(futures), None)
+                wid, idx, sha = futures.pop(done)          # remove from map
                 res = done.result()
                 results.append(res)
                 pbar.update(1)
 
-                # export immediately
-                export_job_outputs(mode, worker_dirs[wid], idx, sha, export_base)
+                # Export immediately if it ran at all
+                if not res.get('skip_reason'):
+                    export_job_outputs(mode, worker_dirs[wid], idx, sha, export_base)
 
-                # reclaim worker and start next pending job
+                # Mark this worker as free
                 available_workers.append(wid)
-                if pending:
+
+                # Launch one new job if commits remain
+                if pending and available_workers:
                     wid2 = available_workers.popleft()
                     idx2, old2, new2 = pending.popleft()
                     repo2 = worker_dirs[wid2]
-                    args2 = (wid2, repo2, time_window, idx2, mode, old2, new2)
-                    fut2 = exe.submit(process_kernel, args2)
-                    future_to_worker[fut2] = (wid2, idx2, new2)
+                    fut2 = exe.submit(
+                        process_kernel,
+                        (wid2, repo2, time_window, idx2, mode, old2, new2)
+                    )
+                    futures[fut2] = (wid2, idx2, new2)
 
-    # write CSV, finish up…
+    # When done, write CSV
     results.sort(key=lambda r: r['job_index'])
     write_results_to_csv(results, output_csv)
     print(f"Done ({time_window}, {mode}). {len(results)-len(skipped)} runs succeeded.")
