@@ -891,7 +891,13 @@ def main():
     # When done, write CSV
     results.sort(key=lambda r: r['job_index'])
     write_results_to_csv(results, output_csv)
-    print(f"Done ({time_window}, {mode}). {len(results)-len(skipped)} runs succeeded.")
+
+    # Count only truly successful runs (no skip_reason at all)
+    success_count = sum(1 for r in results if not r.get('skip_reason'))
+    total = len(results)
+    failed = total - success_count
+
+    print(f"Done ({time_window}, {mode}): {success_count} succeeded, {failed} failed or skipped out of {total}.")
 
 if __name__ == '__main__':
     main()
