@@ -44,35 +44,62 @@ def load_commits(path: str) -> List[str]:
     print(f"[INFO] Loaded {len(commits)} commits from {path}")
     return commits
 
+def _prepare_single_worker(kernel_src: str, tmp_dir: str, idx: int) -> Tuple[int, str]:
+    """
+    Helper for one worker copy/clean.
+    Returns (idx, dst_path).
+    """
+    dst = os.path.join(tmp_dir, f"worker_{idx:03d}")
+    log_path = os.path.join(dst, "clean_worker.log")
+
+    if not os.path.exists(dst):
+        print(f"[INFO] Copying original kernel to '{dst}'")
+        shutil.copytree(kernel_src, dst)
+    else:
+        print(f"[INFO] Cleaning existing worker dir '{dst}'")
+        os.makedirs(dst, exist_ok=True)
+        with open(log_path, "w") as logf:
+            subprocess.run(
+                ["git", "clean", "-dfx"],
+                cwd=dst,
+                check=True,
+                stdout=logf,
+                stderr=subprocess.STDOUT
+            )
+
+    return idx, dst
+
 def prepare_worker_dirs(kernel_src: str,
                         tmp_dir: str,
                         worker_count: int
                         ) -> List[str]:
     """
-    Copy the original kernel source tree worker_count times, once each into
-    tmp_dir/worker_000, worker_001, …
+    Copy the original kernel source tree worker_count times into
+    tmp_dir/worker_000, worker_001, … in parallel.
 
-    If a worker_X directory already exists, run git clean -dfx
-    to reset it back to a pristine state, logging output to clean_worker.log.
+    If a worker_X directory already exists, runs:
+      git clean -dfx
+    and logs to clean_worker.log.
 
-    Returns the list of those directories.
+    Returns the list of dst paths in ascending index order.
     """
     os.makedirs(tmp_dir, exist_ok=True)
 
-    worker_dirs: List[str] = []
-    for i in range(worker_count):
-        dst = os.path.join(tmp_dir, f"worker_{i:03d}")
-        if not os.path.exists(dst):
-            print(f"[INFO] Copying original kernel to '{dst}'")
-            shutil.copytree(kernel_src, dst)
-        else:
-            print(f"[INFO] Cleaning existing worker dir '{dst}'")
-            log_path = os.path.join(dst, "clean_worker.log")
-            with open(log_path, "w") as logf:
-                subprocess.run(["git", "clean", "-dfx"], cwd=dst, check=True,
-                               stdout=logf, stderr=subprocess.STDOUT)
-        worker_dirs.append(dst)
+    # Kick off parallel tasks
+    futures = []
+    with ProcessPoolExecutor(max_workers=worker_count) as exe:
+        for i in range(worker_count):
+            futures.append(exe.submit(_prepare_single_worker, kernel_src, tmp_dir, i))
 
+        # Collect results
+        results: List[Tuple[int,str]] = []
+        for fut in as_completed(futures):
+            idx, dst = fut.result()
+            results.append((idx, dst))
+
+    # Sort by idx and return only the paths
+    results.sort(key=lambda x: x[0])
+    worker_dirs = [dst for _, dst in results]
     return worker_dirs
 
 def assign_tasks(worker_dirs: List[str],
