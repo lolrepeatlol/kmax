@@ -531,7 +531,6 @@ def gather_patterns(mode: str) -> List[str]:
     elif mode == 'krepairDC':
         return [
             '*-x86_64.config',
-            'clean_worker.log'
             '*_koverage.log',
             '*_coverage_results.json',
             'total_coverage_results.json',
@@ -547,7 +546,6 @@ def gather_patterns(mode: str) -> List[str]:
     elif mode == 'krepair':
         return [
             '*-x86_64.config',
-            'clean_worker.log'
             '*_koverage.log',
             '*_coverage_results.json',
             'total_coverage_results.json',
@@ -833,7 +831,7 @@ def main():
     worker_dirs = prepare_worker_dirs(
         kernels_src,
         tmp_dir,
-        worker_count=num_kernels,
+        worker_count=cores,
         max_parallelism=cores
     )
 
@@ -891,8 +889,7 @@ def main():
                 bar.update(1)
 
                 # immediately export this job's outputs
-                if not res.get('skip_reason'):
-                    export_job_outputs(mode, repo_dir, idx, new_sha, export_base)
+                export_job_outputs(mode, repo_dir, idx, new_sha, export_base)
 
     results.sort(key=lambda r: r['job_index'])
     write_results_to_csv(results, output_csv)
