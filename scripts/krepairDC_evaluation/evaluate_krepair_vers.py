@@ -1,3 +1,4 @@
+import random
 import re
 import os
 import csv
@@ -8,6 +9,7 @@ import subprocess
 import argparse
 import statistics
 import sys
+import time
 from collections import deque
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
@@ -98,11 +100,12 @@ def make_patchset(
         old_sha: str,
         new_sha: str,
         worker_id
-) -> Tuple[Path, int, str, str]:
+) -> Tuple[Path, int, str, str]:  # type: ignore
     """
     Given an `old_sha` and `new_sha`, checkout `new_sha` in `repo`,
     count commits in old..new, and `git diff old..new` → patchset_{idx}.diff.
     Returns (patch_path, commit_count, old_sha, new_sha).
+    Retries once if git clean/reset fails.
     """
     tqdm.write(f"[JOB {idx}] [WORKER {worker_id}] ▶ make_patchset: repo={repo}")
 
@@ -112,30 +115,49 @@ def make_patchset(
     if not old_sha:
         raise RuntimeError(f"Blank line in OLD commit list at index {idx}")
 
-    log_path = Path(repo) / f'patchset_{idx}.log'
+    attempts = 0
+    max_attempts = 2
+    while attempts < max_attempts:
+        try:
+            time.sleep(random.uniform(0, 0.5))
+            lock_path = Path(repo) / '.git' / 'index.lock'
+            if lock_path.exists():
+                tqdm.write(f"[JOB {idx}] [WORKER {worker_id}] ⚠ Removing stale lock: {lock_path}")
+                lock_path.unlink()
 
-    # Clean the repo directory
-    with open(log_path, "w") as logf:
-        subprocess.run(
-            ['git', 'clean', '-dfx'],
-            cwd=repo, check=True,
-            stdout=logf, stderr=subprocess.STDOUT
-        )
+            log_path = Path(repo) / f'patchset_{idx}.log'
 
-        subprocess.run(
-            ['git', 'reset', '--hard', 'HEAD'],
-            cwd=repo, check=True,
-            stdout=logf, stderr=subprocess.STDOUT
-        )
+            # Clean the repo directory
+            with open(log_path, "w") as logf:
+                subprocess.run(
+                    ['git', 'clean', '-dfx'],
+                    cwd=repo, check=True,
+                    stdout=logf, stderr=subprocess.STDOUT
+                )
+                subprocess.run(
+                    ['git', 'reset', '--hard', 'HEAD'],
+                    cwd=repo, check=True,
+                    stdout=logf, stderr=subprocess.STDOUT
+                )
+                subprocess.run(
+                    ['git', 'checkout', '-f', new_sha],
+                    cwd=repo, check=True,
+                    stdout=logf, stderr=subprocess.STDOUT
+                )
 
-        # Checkout the new commit
-        subprocess.run(
-            ['git', 'checkout', '-f', new_sha],
-            cwd=repo, check=True,
-            stdout=logf, stderr=subprocess.STDOUT
-        )
+            break  # success, exit retry loop
 
-    # Count commits in old_sha..new_sha (no need to log; returns directly)
+        except Exception as e:
+            tqdm.write(f"[JOB {idx}] [WORKER {worker_id}] Attempt {attempts+1} failed: {e}")
+            if attempts + 1 == max_attempts:
+                raise RuntimeError(f"Failed to prepare repo {repo} for patchset {idx} after {max_attempts} attempts") from e
+            else:
+                tqdm.write(f"[JOB {idx}] [WORKER {worker_id}] Retrying...")
+                time.sleep(1)  # optional short backoff
+        finally:
+            attempts += 1
+
+    # Count commits and generate patch
     cnt = subprocess.check_output(
         ['git', 'rev-list', '--count', '--first-parent', f'{old_sha}..{new_sha}'],
         cwd=repo, text=True
