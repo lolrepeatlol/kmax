@@ -17,7 +17,6 @@ from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional
 from tqdm import tqdm
 sys.stdout.reconfigure(line_buffering=True)
-sys.stderr.reconfigure(line_buffering=True)
 
 # Constants
 VENV_ACTIVATE = os.path.expanduser('/home/alexei/Miscellaneous/kmax/tester_venv/bin/activate')
@@ -537,6 +536,7 @@ def gather_patterns(mode: str) -> List[str]:
             'patch_coverage.log',
             'config_change_percentage.txt',
             'krepairDC_summary.csv',
+            'output_krepairDC.txt',
             'final_chunk_*.smt2',
         ]
     elif mode == 'krepair':
@@ -552,6 +552,7 @@ def gather_patterns(mode: str) -> List[str]:
             'patch_coverage.log',
             'config_change_percentage.txt',
             'krepair_summary.csv',
+            'output_krepair.txt',
             'covered_patch_constraints_*_arch_x86_64.json',
             'patch_constraints.json',
             'original_krepair_smt.smt2',
